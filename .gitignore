@@ -57,3 +57,7 @@ dist/
 # scripts scratch
 scripts/_snapshots/
 scripts/.tmp_*
+
+# local debug dumps
+rls_*.txt
+routes_full_dump_*.txt
