@@ -24,3 +24,32 @@ node_modules/
 .db_inspect/
 audit_*/
 dist/
+
+# mac junk
+.DS_Store
+**/.DS_Store
+
+# backups created by our patch scripts
+.patch_backups/
+scripts/.bak/
+scripts/_backup_*/
+scripts/backup_*/
+scripts/**/.bak/
+**/*.bak
+**/*.bak.*
+**/*.bak.*
+**/*.bak.**
+**/*.bak.*
+
+# temp sql scratch
+scripts/.tmp_*
+scripts/**/.tmp_*
+
+# audits / local outputs
+audit_*/
+*.txt
+.server.log
+.server.pid
+
+# build
+dist/
