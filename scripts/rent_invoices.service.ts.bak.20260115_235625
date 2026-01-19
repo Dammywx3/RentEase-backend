@@ -1,0 +1,281 @@
+import type { PoolClient } from "pg";
+import crypto from "crypto";
+import type { InvoiceStatus } from "../schemas/rent_invoices.schema.js";
+import {
+  findRentInvoiceByTenancyPeriod,
+  insertRentInvoice,
+  listRentInvoices,
+  findRentInvoiceByIdForUpdate,
+  markRentInvoicePaid,
+} from "../repos/rent_invoices.repo.js";
+
+type TenancyMini = {
+  id: string;
+  tenant_id: string;
+  property_id: string;
+  listing_id: string | null;
+  rent_amount: string;
+};
+
+type PaymentRowMini = { id: string };
+
+function num(x: any): number {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : 0;
+}
+
+export async function getRentInvoices(
+  client: PoolClient,
+  args: {
+    limit: number;
+    offset: number;
+    tenancyId?: string;
+    tenantId?: string;
+    propertyId?: string;
+    status?: InvoiceStatus;
+  }
+) {
+  return listRentInvoices(client, {
+    limit: args.limit,
+    offset: args.offset,
+    tenancy_id: args.tenancyId,
+    tenant_id: args.tenantId,
+    property_id: args.propertyId,
+    status: args.status,
+  });
+}
+
+export async function generateRentInvoiceForTenancy(
+  client: PoolClient,
+  args: {
+    tenancyId: string;
+    periodStart: string;
+    periodEnd: string;
+    dueDate: string;
+
+    subtotal?: number;
+    lateFeeAmount?: number | null;
+    currency?: string | null;
+    status?: InvoiceStatus | null;
+    notes?: string | null;
+  }
+): Promise<{ row: any; reused: boolean }> {
+  // Idempotency: reuse if same period already exists
+  const existing = await findRentInvoiceByTenancyPeriod(client, {
+    tenancy_id: args.tenancyId,
+    period_start: args.periodStart,
+    period_end: args.periodEnd,
+    due_date: args.dueDate,
+  });
+  if (existing) return { row: existing, reused: true };
+
+  // Load tenancy basics
+  const { rows } = await client.query<TenancyMini>(
+    `
+    SELECT
+      id,
+      tenant_id,
+      property_id,
+      listing_id,
+      rent_amount::text AS rent_amount
+    FROM public.tenancies
+    WHERE id = $1::uuid
+      AND deleted_at IS NULL
+    LIMIT 1;
+    `,
+    [args.tenancyId]
+  );
+
+  const tenancy = rows[0];
+  if (!tenancy) {
+    const e: any = new Error("Tenancy not found");
+    e.code = "TENANCY_NOT_FOUND";
+    throw e;
+  }
+
+  const subtotal = typeof args.subtotal === "number" ? args.subtotal : Number(tenancy.rent_amount);
+  const lateFee = args.lateFeeAmount == null ? 0 : Number(args.lateFeeAmount);
+  const total = subtotal + lateFee;
+
+  const currency = (args.currency ?? "USD") || "USD";
+  const status: InvoiceStatus = (args.status ?? "issued") || "issued";
+
+  const row = await insertRentInvoice(client, {
+    tenancy_id: args.tenancyId,
+    tenant_id: tenancy.tenant_id,
+    property_id: tenancy.property_id,
+
+    period_start: args.periodStart,
+    period_end: args.periodEnd,
+    due_date: args.dueDate,
+
+    subtotal,
+    late_fee_amount: lateFee,
+    total_amount: total,
+
+    currency,
+    status,
+    notes: args.notes ?? null,
+  });
+
+  return { row, reused: false };
+}
+
+/**
+ * PAY RENT INVOICE
+ * Creates:
+ * - payments row (successful)
+ * - invoice_payments row (link)
+ * - updates rent_invoices: paid_amount, paid_at, status='paid'
+ *
+ * Notes:
+ * - payments requires listing_id (NOT NULL) => tenancy.listing_id must exist.
+ * - invoice_payments insert policy allows admin OR db role 'rentease_service'.
+ */
+export async function payRentInvoiceById(
+  client: PoolClient,
+  args: {
+    invoiceId: string;
+    paymentMethod: "card" | "bank_transfer" | "wallet";
+    amount?: number;
+    currency?: string;
+  }
+): Promise<{ invoice: any; payment_id: string }> {
+  const inv = await findRentInvoiceByIdForUpdate(client, args.invoiceId);
+  if (!inv) {
+    const e: any = new Error("Invoice not found");
+    e.code = "INVOICE_NOT_FOUND";
+    throw e;
+  }
+
+  if (inv.status === "void" || inv.status === "cancelled") {
+    const e: any = new Error(`Invoice is ${inv.status} and cannot be paid`);
+    e.code = "INVOICE_NOT_PAYABLE";
+    throw e;
+  }
+
+  const total = num(inv.total_amount);
+  const alreadyPaid = num(inv.paid_amount ?? "0");
+  const remaining = Math.max(0, total - alreadyPaid);
+
+  if (remaining <= 0 || inv.status === "paid") {
+    // idempotent-ish: if fully paid, just return
+    return { invoice: inv, payment_id: "" };
+  }
+
+  const payAmount = typeof args.amount === "number" ? args.amount : remaining;
+  if (payAmount <= 0 || payAmount > remaining + 0.00001) {
+    const e: any = new Error(`Invalid amount. Remaining balance is ${remaining}`);
+    e.code = "INVALID_PAYMENT_AMOUNT";
+    throw e;
+  }
+
+  // Load tenancy to get listing_id required by payments table
+  const { rows: tenRows } = await client.query<TenancyMini>(
+    `
+    SELECT
+      id,
+      tenant_id,
+      property_id,
+      listing_id,
+      rent_amount::text AS rent_amount
+    FROM public.tenancies
+    WHERE id = $1::uuid
+      AND deleted_at IS NULL
+    LIMIT 1;
+    `,
+    [inv.tenancy_id]
+  );
+
+  const tenancy = tenRows[0];
+  if (!tenancy) {
+    const e: any = new Error("Tenancy not found for invoice");
+    e.code = "TENANCY_NOT_FOUND";
+    throw e;
+  }
+  if (!tenancy.listing_id) {
+    const e: any = new Error("Cannot create payment: tenancy.listing_id is NULL but payments.listing_id is NOT NULL");
+    e.code = "LISTING_ID_REQUIRED";
+    throw e;
+  }
+
+  const currency = (args.currency ?? inv.currency ?? "USD").toUpperCase();
+
+  // Create payment
+  const txRef = `inv_${inv.invoice_number ?? "na"}_${crypto.randomUUID()}`.slice(0, 100);
+
+  const { rows: payRows } = await client.query<PaymentRowMini>(
+    `
+    INSERT INTO public.payments (
+      tenant_id,
+      listing_id,
+      property_id,
+      amount,
+      currency,
+      status,
+      transaction_reference,
+      payment_method,
+      completed_at
+    )
+    VALUES (
+      $1::uuid,
+      $2::uuid,
+      $3::uuid,
+      $4::numeric,
+      $5::varchar(3),
+      'successful'::payment_status,
+      $6::varchar(100),
+      $7::payment_method,
+      NOW()
+    )
+    RETURNING id;
+    `,
+    [
+      inv.tenant_id,
+      tenancy.listing_id,
+      inv.property_id,
+      payAmount,
+      currency,
+      txRef,
+      args.paymentMethod,
+    ]
+  );
+
+  const paymentId = payRows[0]?.id;
+  if (!paymentId) {
+    const e: any = new Error("Failed to create payment");
+    e.code = "PAYMENT_CREATE_FAILED";
+    throw e;
+  }
+
+  // Link invoice_payments
+  await client.query(
+    `
+    INSERT INTO public.invoice_payments (
+      invoice_id,
+      payment_id,
+      amount
+    )
+    VALUES (
+      $1::uuid,
+      $2::uuid,
+      $3::numeric
+    )
+    ON CONFLICT (invoice_id, payment_id) DO NOTHING;
+    `,
+    [inv.id, paymentId, payAmount]
+  );
+
+  // Update invoice paid fields (pay full remaining => status paid)
+  const newPaid = alreadyPaid + payAmount;
+  const paidAtIso = new Date().toISOString();
+
+  const updated = await markRentInvoicePaid(client, {
+    invoice_id: inv.id,
+    paid_amount: newPaid,
+    paid_at_iso: paidAtIso,
+    status: newPaid + 0.00001 >= total ? "paid" : inv.status,
+  });
+
+  return { invoice: updated, payment_id: paymentId };
+}

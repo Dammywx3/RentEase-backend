@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+FILE="src/services/purchase_payments.service.ts"
+mkdir -p scripts/.bak src/services
+
+if [ -f "$FILE" ]; then
+  ts="$(date +%Y%m%d_%H%M%S)"
+  cp "$FILE" "scripts/.bak/purchase_payments.service.ts.bak.$ts"
+  echo "✅ backup -> scripts/.bak/purchase_payments.service.ts.bak.$ts"
+fi
+
+cat > "$FILE" <<'TS'
+import type { PoolClient } from "pg";
+import { computePlatformFeeSplit } from "../config/fees.config.js";
+import { creditPayee, creditPlatformFee } from "./ledger.service.js";
+
+/**
+ * Purchase Payments Service (BUY FLOW)
+ *
+ * Matches the rent invoice pay pattern:
+ *  - computePlatformFeeSplit({ paymentKind: "buy" })
+ *  - creditPlatformFee(...)  -> platform wallet (txn_type=credit_platform_fee)
+ *  - creditPayee(...)        -> seller wallet   (txn_type=credit_payee)
+ *
+ * DB tables you already have:
+ *  - public.property_purchases
+ *  - public.property_purchase_payments (linking payments to purchase)
+ *  - public.escrow_accounts / escrow_transactions / purchase_events etc.
+ *
+ * This service focuses on ledger crediting and marking purchase status as paid (if enum supports it).
+ */
+
+export type PurchasePaymentMethod = "card" | "bank_transfer" | "wallet";
+
+export type PropertyPurchaseRow = {
+  id: string;
+  organization_id: string;
+  property_id: string;
+  listing_id: string | null;
+  buyer_id: string;
+  seller_id: string;
+  agreed_price: string;
+  currency: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+};
+
+const PURCHASE_SELECT = `
+  id,
+  organization_id,
+  property_id,
+  listing_id,
+  buyer_id,
+  seller_id,
+  agreed_price::text AS agreed_price,
+  currency,
+  status::text AS status,
+  created_at::text AS created_at,
+  updated_at::text AS updated_at,
+  deleted_at::text AS deleted_at
+`;
+
+/** Load purchase row (strict org + not deleted) */
+export async function getPropertyPurchase(
+  client: PoolClient,
+  args: { organizationId: string; purchaseId: string }
+): Promise<PropertyPurchaseRow> {
+  const { rows } = await client.query<PropertyPurchaseRow>(
+    `
+    SELECT ${PURCHASE_SELECT}
+    FROM public.property_purchases
+    WHERE id = $1::uuid
+      AND organization_id = $2::uuid
+      AND deleted_at IS NULL
+    LIMIT 1;
+    `,
+    [args.purchaseId, args.organizationId]
+  );
+
+  const row = rows[0];
+  if (!row) {
+    const e: any = new Error("Purchase not found");
+    e.code = "PURCHASE_NOT_FOUND";
+    throw e;
+  }
+  return row;
+}
+
+/**
+ * PAY purchase
+ * Idempotent-ish:
+ *  - If already has BOTH txns (platform fee + payee) for this purchase reference, we return alreadyPaid=true.
+ *  - Also uses ON CONFLICT DO NOTHING in ledger.service insert (assuming you keep that).
+ */
+export async function payPropertyPurchase(
+  client: PoolClient,
+  args: {
+    organizationId: string;
+    purchaseId: string;
+    paymentMethod: PurchasePaymentMethod;
+    amount?: number | null; // defaults to agreed_price
+  }
+): Promise<{
+  purchase: PropertyPurchaseRow;
+  alreadyPaid: boolean;
+  platformFee: number;
+  sellerNet: number;
+}> {
+  const purchase = await getPropertyPurchase(client, {
+    organizationId: args.organizationId,
+    purchaseId: args.purchaseId,
+  });
+
+  // Check if BOTH ledger txns already exist for this purchase (reference_type='purchase')
+  const chk = await client.query<{ txn_type: string; cnt: string }>(
+    `
+    SELECT wt.txn_type::text AS txn_type, count(*)::text AS cnt
+    FROM public.wallet_transactions wt
+    WHERE wt.organization_id = $1::uuid
+      AND wt.reference_type = 'purchase'
+      AND wt.reference_id = $2::uuid
+      AND wt.txn_type IN ('credit_payee'::wallet_transaction_type, 'credit_platform_fee'::wallet_transaction_type)
+    GROUP BY wt.txn_type
+    `,
+    [args.organizationId, purchase.id]
+  );
+
+  const hasPayee = chk.rows.some((r) => r.txn_type === "credit_payee" && Number(r.cnt) > 0);
+  const hasFee = chk.rows.some((r) => r.txn_type === "credit_platform_fee" && Number(r.cnt) > 0);
+
+  if (hasPayee && hasFee) {
+    return { purchase, alreadyPaid: true, platformFee: 0, sellerNet: 0 };
+  }
+
+  const agreed = Number(purchase.agreed_price);
+  const amount = typeof args.amount === "number" ? args.amount : agreed;
+
+  if (Number(amount) !== Number(agreed)) {
+    const e: any = new Error(`Payment.amount (${amount}) must equal agreed_price (${purchase.agreed_price})`);
+    e.code = "AMOUNT_MISMATCH";
+    throw e;
+  }
+
+  const currency = (purchase.currency ?? "USD") || "USD";
+
+  const split = computePlatformFeeSplit({
+    paymentKind: "buy",
+    amount,
+    currency,
+  });
+
+  // 1) credit platform fee
+  await creditPlatformFee(client, {
+    organizationId: args.organizationId,
+    referenceType: "purchase",
+    referenceId: purchase.id,
+    amount: split.platformFee,
+    currency,
+    note: `2.5% platform fee for purchase ${purchase.id}`,
+  });
+
+  // 2) credit seller net
+  await creditPayee(client, {
+    organizationId: args.organizationId,
+    payeeUserId: purchase.seller_id,
+    referenceType: "purchase",
+    referenceId: purchase.id,
+    amount: split.payeeNet,
+    currency,
+    note: `Purchase payout (net) for purchase ${purchase.id}`,
+  });
+
+  // 3) Try to set status='paid' IF enum supports it (safe).
+  // If your purchase_status enum doesn't have 'paid', this block just does nothing.
+  await client.query(
+    `
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM pg_type t
+        JOIN pg_enum e ON t.oid = e.enumtypid
+        WHERE t.typname = 'purchase_status'
+          AND e.enumlabel = 'paid'
+      ) THEN
+        UPDATE public.property_purchases
+        SET status = 'paid'::purchase_status,
+            updated_at = NOW()
+        WHERE id = $1::uuid
+          AND organization_id = $2::uuid
+          AND deleted_at IS NULL;
+      END IF;
+    END $$;
+    `,
+    [purchase.id, args.organizationId]
+  );
+
+  const updated = await getPropertyPurchase(client, {
+    organizationId: args.organizationId,
+    purchaseId: purchase.id,
+  });
+
+  return { purchase: updated, alreadyPaid: false, platformFee: split.platformFee, sellerNet: split.payeeNet };
+}
+TS
+
+echo "✅ PATCHED: $FILE"
+echo "➡️ Next: wire this service into your purchase routes/controller (like rent invoice pay)."

@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="src"
+
+mkdir -p \
+  "$ROOT_DIR/config/constants" \
+  "$ROOT_DIR/core/domain/entities" \
+  "$ROOT_DIR/core/domain/errors" \
+  "$ROOT_DIR/core/domain/services" \
+  "$ROOT_DIR/core/use-cases/auth" \
+  "$ROOT_DIR/core/use-cases/organizations" \
+  "$ROOT_DIR/core/use-cases/users" \
+  "$ROOT_DIR/core/use-cases/properties" \
+  "$ROOT_DIR/core/use-cases/documents" \
+  "$ROOT_DIR/core/use-cases/listings" \
+  "$ROOT_DIR/core/use-cases/applications" \
+  "$ROOT_DIR/core/use-cases/viewings" \
+  "$ROOT_DIR/core/use-cases/tenancies" \
+  "$ROOT_DIR/core/use-cases/payments" \
+  "$ROOT_DIR/core/use-cases/wallet" \
+  "$ROOT_DIR/core/use-cases/payouts" \
+  "$ROOT_DIR/core/use-cases/disputes" \
+  "$ROOT_DIR/core/use-cases/chat" \
+  "$ROOT_DIR/core/use-cases/maintenance" \
+  "$ROOT_DIR/core/use-cases/invoices" \
+  "$ROOT_DIR/core/use-cases/contracts" \
+  "$ROOT_DIR/core/use-cases/support" \
+  "$ROOT_DIR/core/use-cases/leads" \
+  "$ROOT_DIR/core/use-cases/notifications" \
+  "$ROOT_DIR/infrastructure/database/models" \
+  "$ROOT_DIR/infrastructure/database/repositories" \
+  "$ROOT_DIR/infrastructure/database/migrations" \
+  "$ROOT_DIR/infrastructure/database/sql/views" \
+  "$ROOT_DIR/infrastructure/database/sql/functions" \
+  "$ROOT_DIR/infrastructure/storage" \
+  "$ROOT_DIR/infrastructure/email/templates" \
+  "$ROOT_DIR/infrastructure/payments" \
+  "$ROOT_DIR/api/middleware" \
+  "$ROOT_DIR/api/controllers/v1" \
+  "$ROOT_DIR/api/routes/v1" \
+  "$ROOT_DIR/api/dto/request/listings" \
+  "$ROOT_DIR/api/dto/request/applications" \
+  "$ROOT_DIR/api/dto/request/viewings" \
+  "$ROOT_DIR/api/dto/request/payments" \
+  "$ROOT_DIR/api/dto/request/wallet" \
+  "$ROOT_DIR/api/dto/request/payouts" \
+  "$ROOT_DIR/api/dto/request/disputes" \
+  "$ROOT_DIR/api/dto/request/conversations" \
+  "$ROOT_DIR/api/dto/request/maintenance" \
+  "$ROOT_DIR/api/dto/request/invoices" \
+  "$ROOT_DIR/api/dto/request/contracts" \
+  "$ROOT_DIR/api/dto/request/support" \
+  "$ROOT_DIR/api/dto/request/leads" \
+  "$ROOT_DIR/api/dto/response/listings" \
+  "$ROOT_DIR/api/dto/response/applications" \
+  "$ROOT_DIR/api/dto/response/viewings" \
+  "$ROOT_DIR/api/dto/response/payments" \
+  "$ROOT_DIR/api/dto/response/wallet" \
+  "$ROOT_DIR/api/dto/response/payouts" \
+  "$ROOT_DIR/api/dto/response/disputes" \
+  "$ROOT_DIR/api/dto/response/conversations" \
+  "$ROOT_DIR/api/dto/response/maintenance" \
+  "$ROOT_DIR/api/dto/response/invoices" \
+  "$ROOT_DIR/api/dto/response/contracts" \
+  "$ROOT_DIR/api/dto/response/support" \
+  "$ROOT_DIR/api/dto/response/leads" \
+  "$ROOT_DIR/shared/utils" \
+  "$ROOT_DIR/shared/middlewares" \
+  "$ROOT_DIR/shared/types"
+
+touch \
+  "$ROOT_DIR/config/app.config.js" \
+  "$ROOT_DIR/config/database.js" \
+  "$ROOT_DIR/config/redis.js" \
+  "$ROOT_DIR/config/aws.config.js" \
+  "$ROOT_DIR/config/payment.config.js" \
+  "$ROOT_DIR/config/email.config.js" \
+  "$ROOT_DIR/config/queue.config.js" \
+  "$ROOT_DIR/config/security.config.js" \
+  "$ROOT_DIR/config/monitoring.config.js" \
+  "$ROOT_DIR/config/constants/app.constants.js" \
+  "$ROOT_DIR/config/constants/user.constants.js" \
+  "$ROOT_DIR/config/constants/property.constants.js" \
+  "$ROOT_DIR/config/constants/listing.constants.js" \
+  "$ROOT_DIR/config/constants/tenancy.constants.js" \
+  "$ROOT_DIR/config/constants/application.constants.js" \
+  "$ROOT_DIR/config/constants/viewing.constants.js" \
+  "$ROOT_DIR/config/constants/payment.constants.js" \
+  "$ROOT_DIR/config/constants/wallet.constants.js" \
+  "$ROOT_DIR/config/constants/payout.constants.js" \
+  "$ROOT_DIR/config/constants/dispute.constants.js" \
+  "$ROOT_DIR/config/constants/chat.constants.js" \
+  "$ROOT_DIR/config/constants/maintenance.constants.js" \
+  "$ROOT_DIR/config/constants/invoice.constants.js" \
+  "$ROOT_DIR/config/constants/contract.constants.js" \
+  "$ROOT_DIR/config/constants/notification.constants.js"
+
+touch \
+  "$ROOT_DIR/core/domain/entities/Organization.entity.js" \
+  "$ROOT_DIR/core/domain/entities/User.entity.js" \
+  "$ROOT_DIR/core/domain/entities/Property.entity.js" \
+  "$ROOT_DIR/core/domain/entities/PropertySaleDetails.entity.js" \
+  "$ROOT_DIR/core/domain/entities/PropertyMedia.entity.js" \
+  "$ROOT_DIR/core/domain/entities/Document.entity.js" \
+  "$ROOT_DIR/core/domain/entities/PropertyListing.entity.js" \
+  "$ROOT_DIR/core/domain/entities/PropertySaleDisclosure.entity.js" \
+  "$ROOT_DIR/core/domain/entities/SavedListing.entity.js" \
+  "$ROOT_DIR/core/domain/entities/RentalApplication.entity.js" \
+  "$ROOT_DIR/core/domain/entities/PropertyViewing.entity.js" \
+  "$ROOT_DIR/core/domain/entities/Tenancy.entity.js" \
+  "$ROOT_DIR/core/domain/entities/Payment.entity.js" \
+  "$ROOT_DIR/core/domain/entities/PaymentSplit.entity.js" \
+  "$ROOT_DIR/core/domain/entities/WalletAccount.entity.js" \
+  "$ROOT_DIR/core/domain/entities/WalletTransaction.entity.js" \
+  "$ROOT_DIR/core/domain/entities/PayoutAccount.entity.js" \
+  "$ROOT_DIR/core/domain/entities/Payout.entity.js" \
+  "$ROOT_DIR/core/domain/entities/Dispute.entity.js" \
+  "$ROOT_DIR/core/domain/entities/DisputeMessage.entity.js" \
+  "$ROOT_DIR/core/domain/entities/Conversation.entity.js" \
+  "$ROOT_DIR/core/domain/entities/ConversationParticipant.entity.js" \
+  "$ROOT_DIR/core/domain/entities/Message.entity.js" \
+  "$ROOT_DIR/core/domain/entities/MessageAttachment.entity.js" \
+  "$ROOT_DIR/core/domain/entities/Contractor.entity.js" \
+  "$ROOT_DIR/core/domain/entities/MaintenanceRequest.entity.js" \
+  "$ROOT_DIR/core/domain/entities/MaintenanceUpdate.entity.js" \
+  "$ROOT_DIR/core/domain/entities/MaintenanceAttachment.entity.js" \
+  "$ROOT_DIR/core/domain/entities/Notification.entity.js" \
+  "$ROOT_DIR/core/domain/entities/SupportTicket.entity.js" \
+  "$ROOT_DIR/core/domain/entities/Lead.entity.js" \
+  "$ROOT_DIR/core/domain/entities/LeadActivity.entity.js" \
+  "$ROOT_DIR/core/domain/entities/RentInvoice.entity.js" \
+  "$ROOT_DIR/core/domain/entities/InvoicePayment.entity.js" \
+  "$ROOT_DIR/core/domain/entities/CustomerPaymentMethod.entity.js" \
+  "$ROOT_DIR/core/domain/entities/Contract.entity.js" \
+  "$ROOT_DIR/core/domain/entities/ContractParty.entity.js" \
+  "$ROOT_DIR/core/domain/entities/ContractSignature.entity.js" \
+  "$ROOT_DIR/core/domain/entities/AuditLog.entity.js"
+
+touch \
+  "$ROOT_DIR/core/domain/errors/DomainError.js" \
+  "$ROOT_DIR/core/domain/errors/NotFoundError.js" \
+  "$ROOT_DIR/core/domain/errors/ValidationError.js" \
+  "$ROOT_DIR/core/domain/errors/UnauthorizedError.js" \
+  "$ROOT_DIR/core/domain/services/IdGenerator.service.js" \
+  "$ROOT_DIR/core/domain/services/Money.service.js" \
+  "$ROOT_DIR/core/domain/services/Time.service.js"
+
+touch \
+  "$ROOT_DIR/core/use-cases/auth/Register.usecase.js" \
+  "$ROOT_DIR/core/use-cases/auth/Login.usecase.js" \
+  "$ROOT_DIR/core/use-cases/auth/RefreshToken.usecase.js" \
+  "$ROOT_DIR/core/use-cases/auth/Logout.usecase.js" \
+  "$ROOT_DIR/core/use-cases/organizations/CreateOrganization.usecase.js" \
+  "$ROOT_DIR/core/use-cases/organizations/UpdateOrganization.usecase.js" \
+  "$ROOT_DIR/core/use-cases/organizations/GetOrganization.usecase.js" \
+  "$ROOT_DIR/core/use-cases/users/CreateUser.usecase.js" \
+  "$ROOT_DIR/core/use-cases/users/UpdateUser.usecase.js" \
+  "$ROOT_DIR/core/use-cases/users/VerifyUser.usecase.js" \
+  "$ROOT_DIR/core/use-cases/users/SuspendUser.usecase.js" \
+  "$ROOT_DIR/core/use-cases/properties/CreateProperty.usecase.js" \
+  "$ROOT_DIR/core/use-cases/properties/UpdateProperty.usecase.js" \
+  "$ROOT_DIR/core/use-cases/properties/UploadPropertyMedia.usecase.js" \
+  "$ROOT_DIR/core/use-cases/properties/SetCoverMedia.usecase.js" \
+  "$ROOT_DIR/core/use-cases/properties/AddSaleDetails.usecase.js" \
+  "$ROOT_DIR/core/use-cases/documents/UploadDocument.usecase.js" \
+  "$ROOT_DIR/core/use-cases/documents/VerifyDocument.usecase.js" \
+  "$ROOT_DIR/core/use-cases/documents/DeleteDocument.usecase.js" \
+  "$ROOT_DIR/core/use-cases/listings/CreateListing.usecase.js" \
+  "$ROOT_DIR/core/use-cases/listings/UpdateListing.usecase.js" \
+  "$ROOT_DIR/core/use-cases/listings/ActivateListing.usecase.js" \
+  "$ROOT_DIR/core/use-cases/listings/PauseListing.usecase.js" \
+  "$ROOT_DIR/core/use-cases/listings/ApproveListing.usecase.js" \
+  "$ROOT_DIR/core/use-cases/listings/ListMarketplace.usecase.js" \
+  "$ROOT_DIR/core/use-cases/applications/ApplyForListing.usecase.js" \
+  "$ROOT_DIR/core/use-cases/applications/ReviewApplication.usecase.js" \
+  "$ROOT_DIR/core/use-cases/applications/WithdrawApplication.usecase.js" \
+  "$ROOT_DIR/core/use-cases/viewings/ScheduleViewing.usecase.js" \
+  "$ROOT_DIR/core/use-cases/viewings/ConfirmViewing.usecase.js" \
+  "$ROOT_DIR/core/use-cases/viewings/CancelViewing.usecase.js" \
+  "$ROOT_DIR/core/use-cases/viewings/CompleteViewing.usecase.js" \
+  "$ROOT_DIR/core/use-cases/tenancies/CreateTenancy.usecase.js" \
+  "$ROOT_DIR/core/use-cases/tenancies/EndTenancy.usecase.js" \
+  "$ROOT_DIR/core/use-cases/tenancies/ExtendTenancy.usecase.js" \
+  "$ROOT_DIR/core/use-cases/payments/CreatePayment.usecase.js" \
+  "$ROOT_DIR/core/use-cases/payments/ConfirmPaymentWebhook.usecase.js" \
+  "$ROOT_DIR/core/use-cases/payments/GenerateReceipt.usecase.js" \
+  "$ROOT_DIR/core/use-cases/payments/RefundPayment.usecase.js" \
+  "$ROOT_DIR/core/use-cases/wallet/GetWalletBalance.usecase.js" \
+  "$ROOT_DIR/core/use-cases/wallet/EnsureWalletAccount.usecase.js" \
+  "$ROOT_DIR/core/use-cases/wallet/ListWalletTransactions.usecase.js" \
+  "$ROOT_DIR/core/use-cases/payouts/AddPayoutAccount.usecase.js" \
+  "$ROOT_DIR/core/use-cases/payouts/RequestPayout.usecase.js" \
+  "$ROOT_DIR/core/use-cases/payouts/ProcessPayout.usecase.js" \
+  "$ROOT_DIR/core/use-cases/disputes/OpenDispute.usecase.js" \
+  "$ROOT_DIR/core/use-cases/disputes/SendDisputeMessage.usecase.js" \
+  "$ROOT_DIR/core/use-cases/disputes/ResolveDispute.usecase.js" \
+  "$ROOT_DIR/core/use-cases/chat/CreateConversation.usecase.js" \
+  "$ROOT_DIR/core/use-cases/chat/AddParticipant.usecase.js" \
+  "$ROOT_DIR/core/use-cases/chat/RemoveParticipant.usecase.js" \
+  "$ROOT_DIR/core/use-cases/chat/SendMessage.usecase.js" \
+  "$ROOT_DIR/core/use-cases/chat/GetConversation.usecase.js" \
+  "$ROOT_DIR/core/use-cases/maintenance/CreateMaintenanceRequest.usecase.js" \
+  "$ROOT_DIR/core/use-cases/maintenance/AssignContractor.usecase.js" \
+  "$ROOT_DIR/core/use-cases/maintenance/AddMaintenanceUpdate.usecase.js" \
+  "$ROOT_DIR/core/use-cases/maintenance/CloseMaintenanceRequest.usecase.js" \
+  "$ROOT_DIR/core/use-cases/invoices/IssueInvoice.usecase.js" \
+  "$ROOT_DIR/core/use-cases/invoices/AttachPaymentToInvoice.usecase.js" \
+  "$ROOT_DIR/core/use-cases/invoices/MarkInvoicePaid.usecase.js" \
+  "$ROOT_DIR/core/use-cases/contracts/CreateContract.usecase.js" \
+  "$ROOT_DIR/core/use-cases/contracts/SendContract.usecase.js" \
+  "$ROOT_DIR/core/use-cases/contracts/SignContract.usecase.js" \
+  "$ROOT_DIR/core/use-cases/support/CreateSupportTicket.usecase.js" \
+  "$ROOT_DIR/core/use-cases/support/AssignSupportTicket.usecase.js" \
+  "$ROOT_DIR/core/use-cases/support/ResolveSupportTicket.usecase.js" \
+  "$ROOT_DIR/core/use-cases/leads/CreateLead.usecase.js" \
+  "$ROOT_DIR/core/use-cases/leads/LogLeadActivity.usecase.js" \
+  "$ROOT_DIR/core/use-cases/notifications/SendNotification.usecase.js" \
+  "$ROOT_DIR/core/use-cases/notifications/MarkNotificationRead.usecase.js"
+
+touch \
+  "$ROOT_DIR/infrastructure/database/models/Organization.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/User.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/Property.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/PropertySaleDetails.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/PropertyMedia.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/Document.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/PropertyListing.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/PropertySaleDisclosure.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/SavedListing.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/RentalApplication.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/PropertyViewing.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/Tenancy.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/Payment.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/PaymentSplit.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/WalletAccount.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/WalletTransaction.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/PayoutAccount.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/Payout.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/Dispute.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/DisputeMessage.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/Conversation.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/ConversationParticipant.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/Message.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/MessageAttachment.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/Contractor.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/MaintenanceRequest.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/MaintenanceUpdate.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/MaintenanceAttachment.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/Notification.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/SupportTicket.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/Lead.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/LeadActivity.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/RentInvoice.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/InvoicePayment.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/CustomerPaymentMethod.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/Contract.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/ContractParty.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/ContractSignature.model.js" \
+  "$ROOT_DIR/infrastructure/database/models/AuditLog.model.js"
+
+touch \
+  "$ROOT_DIR/infrastructure/database/repositories/OrganizationRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/UserRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/PropertyRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/PropertySaleDetailsRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/PropertyMediaRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/DocumentRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/PropertyListingRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/PropertySaleDisclosureRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/SavedListingRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/RentalApplicationRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/PropertyViewingRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/TenancyRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/PaymentRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/PaymentSplitRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/WalletAccountRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/WalletTransactionRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/PayoutAccountRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/PayoutRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/DisputeRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/DisputeMessageRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/ConversationRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/ConversationParticipantRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/MessageRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/MessageAttachmentRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/ContractorRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/MaintenanceRequestRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/MaintenanceUpdateRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/MaintenanceAttachmentRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/NotificationRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/SupportTicketRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/LeadRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/LeadActivityRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/RentInvoiceRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/InvoicePaymentRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/CustomerPaymentMethodRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/ContractRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/ContractPartyRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/ContractSignatureRepository.js" \
+  "$ROOT_DIR/infrastructure/database/repositories/AuditLogRepository.js"
+
+touch \
+  "$ROOT_DIR/infrastructure/database/migrations/0001_core.sql" \
+  "$ROOT_DIR/infrastructure/database/migrations/0002_properties.sql" \
+  "$ROOT_DIR/infrastructure/database/migrations/0003_listings_applications_viewings.sql" \
+  "$ROOT_DIR/infrastructure/database/migrations/0004_payments_wallets_payouts.sql" \
+  "$ROOT_DIR/infrastructure/database/migrations/0005_chat.sql" \
+  "$ROOT_DIR/infrastructure/database/migrations/0006_maintenance.sql" \
+  "$ROOT_DIR/infrastructure/database/migrations/0007_invoices_contracts.sql" \
+  "$ROOT_DIR/infrastructure/database/migrations/0008_support_leads_audit.sql" \
+  "$ROOT_DIR/infrastructure/database/sql/views/marketplace_listings.sql" \
+  "$ROOT_DIR/infrastructure/database/sql/views/wallet_balances.sql" \
+  "$ROOT_DIR/infrastructure/database/sql/functions/generate_receipt.sql" \
+  "$ROOT_DIR/infrastructure/database/sql/functions/generate_payment_splits.sql" \
+  "$ROOT_DIR/infrastructure/database/sql/functions/ensure_wallet_account.sql" \
+  "$ROOT_DIR/infrastructure/database/sql/functions/wallet_credit_from_splits.sql"
+
+touch \
+  "$ROOT_DIR/infrastructure/storage/s3Client.js" \
+  "$ROOT_DIR/infrastructure/storage/upload.service.js" \
+  "$ROOT_DIR/infrastructure/email/email.service.js" \
+  "$ROOT_DIR/infrastructure/email/templates/receipt.hbs" \
+  "$ROOT_DIR/infrastructure/email/templates/invite.hbs" \
+  "$ROOT_DIR/infrastructure/email/templates/reset_password.hbs" \
+  "$ROOT_DIR/infrastructure/payments/paymentGateway.service.js" \
+  "$ROOT_DIR/infrastructure/payments/stripe.service.js" \
+  "$ROOT_DIR/infrastructure/payments/webhook.handler.js"
+
+touch \
+  "$ROOT_DIR/api/middleware/auth.middleware.js" \
+  "$ROOT_DIR/api/middleware/rlsContext.middleware.js" \
+  "$ROOT_DIR/api/middleware/validate.middleware.js" \
+  "$ROOT_DIR/api/middleware/rateLimit.middleware.js" \
+  "$ROOT_DIR/api/middleware/error.middleware.js" \
+  "$ROOT_DIR/api/controllers/v1/AuthController.js" \
+  "$ROOT_DIR/api/controllers/v1/OrganizationController.js" \
+  "$ROOT_DIR/api/controllers/v1/UserController.js" \
+  "$ROOT_DIR/api/controllers/v1/PropertyController.js" \
+  "$ROOT_DIR/api/controllers/v1/ListingController.js" \
+  "$ROOT_DIR/api/controllers/v1/ApplicationController.js" \
+  "$ROOT_DIR/api/controllers/v1/ViewingController.js" \
+  "$ROOT_DIR/api/controllers/v1/TenancyController.js" \
+  "$ROOT_DIR/api/controllers/v1/PaymentController.js" \
+  "$ROOT_DIR/api/controllers/v1/WalletController.js" \
+  "$ROOT_DIR/api/controllers/v1/PayoutController.js" \
+  "$ROOT_DIR/api/controllers/v1/DisputeController.js" \
+  "$ROOT_DIR/api/controllers/v1/ConversationController.js" \
+  "$ROOT_DIR/api/controllers/v1/MaintenanceController.js" \
+  "$ROOT_DIR/api/controllers/v1/InvoiceController.js" \
+  "$ROOT_DIR/api/controllers/v1/ContractController.js" \
+  "$ROOT_DIR/api/controllers/v1/SupportController.js" \
+  "$ROOT_DIR/api/controllers/v1/LeadController.js" \
+  "$ROOT_DIR/api/controllers/v1/NotificationController.js" \
+  "$ROOT_DIR/api/controllers/v1/AdminController.js" \
+  "$ROOT_DIR/api/routes/v1/auth.routes.js" \
+  "$ROOT_DIR/api/routes/v1/organizations.routes.js" \
+  "$ROOT_DIR/api/routes/v1/users.routes.js" \
+  "$ROOT_DIR/api/routes/v1/properties.routes.js" \
+  "$ROOT_DIR/api/routes/v1/listings.routes.js" \
+  "$ROOT_DIR/api/routes/v1/applications.routes.js" \
+  "$ROOT_DIR/api/routes/v1/viewings.routes.js" \
+  "$ROOT_DIR/api/routes/v1/tenancies.routes.js" \
+  "$ROOT_DIR/api/routes/v1/payments.routes.js" \
+  "$ROOT_DIR/api/routes/v1/wallet.routes.js" \
+  "$ROOT_DIR/api/routes/v1/payouts.routes.js" \
+  "$ROOT_DIR/api/routes/v1/disputes.routes.js" \
+  "$ROOT_DIR/api/routes/v1/conversations.routes.js" \
+  "$ROOT_DIR/api/routes/v1/maintenance.routes.js" \
+  "$ROOT_DIR/api/routes/v1/invoices.routes.js" \
+  "$ROOT_DIR/api/routes/v1/contracts.routes.js" \
+  "$ROOT_DIR/api/routes/v1/support.routes.js" \
+  "$ROOT_DIR/api/routes/v1/leads.routes.js" \
+  "$ROOT_DIR/api/routes/v1/notifications.routes.js" \
+  "$ROOT_DIR/api/routes/v1/admin.routes.js" \
+  "$ROOT_DIR/api/routes/index.js"
+
+touch \
+  "$ROOT_DIR/shared/utils/pagination.js" \
+  "$ROOT_DIR/shared/utils/sanitize.js" \
+  "$ROOT_DIR/shared/utils/logger.js" \
+  "$ROOT_DIR/shared/utils/validators.js" \
+  "$ROOT_DIR/shared/middlewares/asyncHandler.js" \
+  "$ROOT_DIR/shared/types/index.js"
+
+echo "✅ Created RentEase backend folder structure under ./$ROOT_DIR"
+echo "Run: find $ROOT_DIR -type f | wc -l   (to see how many files were created)"

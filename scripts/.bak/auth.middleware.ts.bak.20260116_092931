@@ -1,0 +1,25 @@
+// src/api/middleware/auth.middleware.ts
+import type { FastifyReply, FastifyRequest } from "fastify";
+
+/**
+ * Route-level auth middleware.
+ * Requires @fastify/jwt to be registered + app.decorate("authenticate", ...)
+ *
+ * Usage:
+ *  app.get("/v1/me", { preHandler: [authMiddleware] }, async (req) => {...})
+ */
+export async function authMiddleware(
+  req: FastifyRequest,
+  reply: FastifyReply
+) {
+  try {
+    // Provided by @fastify/jwt
+    await req.jwtVerify();
+  } catch {
+    return reply.code(401).send({
+      ok: false,
+      error: "UNAUTHORIZED",
+      message: "Invalid or missing token",
+    });
+  }
+}

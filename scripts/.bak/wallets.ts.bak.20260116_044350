@@ -1,0 +1,46 @@
+import type { PoolClient } from "pg";
+
+export async function ensureWalletAccount(
+  client: PoolClient,
+  args: {
+    organizationId: string;
+    userId: string | null;
+    currency: string;
+    isPlatformWallet: boolean;
+  }
+): Promise<string> {
+  const { rows: found } = await client.query<{ id: string }>(
+    `
+    SELECT id
+    FROM public.wallet_accounts
+    WHERE organization_id = $1::uuid
+      AND user_id IS NOT DISTINCT FROM $2::uuid
+      AND currency = $3::text
+      AND is_platform_wallet = $4::boolean
+    ORDER BY created_at ASC
+    LIMIT 1;
+    `,
+    [args.organizationId, args.userId, args.currency, args.isPlatformWallet]
+  );
+
+  if (found[0]?.id) return found[0].id;
+
+  const { rows: created } = await client.query<{ id: string }>(
+    `
+    INSERT INTO public.wallet_accounts (
+      organization_id,
+      user_id,
+      currency,
+      is_platform_wallet
+    )
+    VALUES ($1::uuid, $2::uuid, $3::text, $4::boolean)
+    ON CONFLICT (organization_id, user_id, currency, is_platform_wallet)
+    DO UPDATE SET organization_id = EXCLUDED.organization_id
+    RETURNING id;
+    `,
+    [args.organizationId, args.userId, args.currency, args.isPlatformWallet]
+  );
+
+  if (!created[0]?.id) throw new Error("ensureWalletAccount: failed to create wallet_account");
+  return created[0].id;
+}

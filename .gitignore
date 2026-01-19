@@ -1,0 +1,26 @@
+node_modules
+# Keep environment variables out of version control
+.env
+
+/src/generated/prisma
+
+# local env
+.env
+.env.*
+
+# deps
+node_modules/
+
+# logs
+*.log
+.server.log
+.server.pid
+
+# local folders you have
+.backup/
+.backup_tenancies_fix_*/
+.patch_backups/
+.tmp/
+.db_inspect/
+audit_*/
+dist/

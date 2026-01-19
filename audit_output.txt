@@ -1,0 +1,4010 @@
+============================================================
+RentEase Backend Audit (codebase + db integration views)
+Root: .
+============================================================
+
+==================== 1) Repo overview ====================
+/Users/mac/Downloads/RentEase--Backend
+
+Node/TS config files:
+package.json
+tsconfig.json
+
+src tree (top-level):
+src
+src/api
+src/api/controllers
+src/api/dto
+src/config
+src/config/constants
+src/core
+src/core/domain
+src/core/use-cases
+src/db
+src/generated
+src/generated/prisma
+src/infrastructure
+src/infrastructure/database
+src/infrastructure/email
+src/infrastructure/payments
+src/infrastructure/storage
+src/lib
+src/middleware
+src/modules
+src/modules/organizations
+src/plugins
+src/repos
+src/repositories
+src/routes
+src/schemas
+src/services
+src/shared
+src/shared/middlewares
+src/shared/types
+src/shared/utils
+src/types
+src/utils
+
+==================== 2) Entry points & server/bootstrap ====================
+
+----- src/server.ts -----
+import "dotenv/config";
+import Fastify from "fastify";
+import postgres from "@fastify/postgres";
+
+import { env } from "./config/env.js";
+import { prisma } from "./lib/prisma.js";
+
+import { registerCors } from "./plugins/cors.js";
+import registerJwt from "./plugins/jwt.js";
+import { registerSecurity } from "./plugins/security.js";
+
+import { registerErrorHandler } from "./middleware/error.middleware.js";
+import { registerRateLimit } from "./middleware/rateLimit.middleware.js";
+
+import { registerRoutes } from "./routes/index.js";
+import { closePool } from "./config/database.js";
+
+async function start() {
+  const app = Fastify({ logger: true });
+
+  // 1) Error handler early
+  registerErrorHandler(app);
+
+  // 2) Core plugins
+  await app.register(registerCors);
+  await app.register(registerSecurity);
+  await app.register(registerJwt);
+
+// FASTIFY_PG_REGISTERED
+// Provide app.pg for routes that use app.pg.connect()
+const connectionString =
+  process.env.DATABASE_URL ||
+  (env as any).databaseUrl ||
+  (env as any).dbUrl ||
+  (env as any).database_url ||
+  `postgres://localhost:5432/${process.env.DB_NAME || "rentease"}`;
+
+await app.register(postgres, { connectionString });
+
+
+  // 3) Global rate limit
+  await app.register(registerRateLimit, {
+    global: { max: 200, timeWindow: "1 minute" },
+  });
+
+  // 4) Routes ✅ correct Fastify way (registered once)
+  await app.register(registerRoutes);
+  app.get("/debug/routes", async () => {
+  // @ts-ignore
+  return app.printRoutes();
+});
+
+  // DB ping (temporary)
+  app.get("/v1/db/ping", async () => {
+    await prisma.$queryRaw`SELECT 1`;
+    return { ok: true, db: "connected" };
+  });
+
+  // Graceful shutdown
+  app.addHook("onClose", async () => {
+    await prisma.$disconnect();
+    await closePool();
+  });
+
+  await app.listen({ port: env.port, host: "0.0.0.0" });
+}
+
+start().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+
+
+
+
+
+----- src/routes/index.ts -----
+import type { FastifyInstance } from "fastify";
+
+import { healthRoutes } from "./health.js";
+import { demoRoutes } from "./demo.js";
+
+import { authRoutes } from "./auth.js";
+import { meRoutes } from "./me.js";
+import { organizationRoutes } from "./organizations.js";
+
+import { propertyRoutes } from "./properties.js";
+import { listingRoutes } from "./listings.js";
+import { viewingRoutes } from "./viewings.js";
+import { applicationRoutes } from "./applications.js";
+import { tenancyRoutes } from "./tenancies.js";
+
+import { rentInvoicesRoutes } from "./rent_invoices.js";
+import purchasesRoutes from "./purchases.routes.js";
+
+export async function registerRoutes(app: FastifyInstance) {
+  // Public / non-versioned routes
+  await app.register(healthRoutes);
+  await app.register(demoRoutes);
+
+  // Versioned API routes
+  await app.register(
+    async (v1) => {
+      await v1.register(authRoutes);
+      await v1.register(meRoutes);
+
+      await v1.register(organizationRoutes);
+      await v1.register(propertyRoutes);
+      await v1.register(listingRoutes);
+      await v1.register(viewingRoutes);
+      await v1.register(applicationRoutes);
+      await v1.register(tenancyRoutes);
+
+      await v1.register(rentInvoicesRoutes);
+      await v1.register(purchasesRoutes);
+    },
+    { prefix: "/v1" }
+  );
+}
+==================== 3) Auth/JWT middleware + fastify decorations ====================
+
+----- src/plugins/jwt.ts -----
+// src/plugins/jwt.ts
+import fp from "fastify-plugin";
+import fastifyJwt from "@fastify/jwt";
+import type { FastifyReply, FastifyRequest } from "fastify";
+
+import { env } from "../config/env.js";
+import { requireAuth, optionalAuth } from "../middleware/auth.js";
+
+export type JwtPayload = {
+  sub: string;
+  org: string;
+  role: "tenant" | "landlord" | "agent" | "admin";
+  email?: string;
+};
+
+export default fp(async (app) => {
+  await app.register(fastifyJwt, { secret: env.jwtSecret });
+
+  /**
+   * ✅ Strict auth guard (recommended for all protected routes)
+   * - JWT required
+   * - x-organization-id REQUIRED
+   * - header org MUST match token org
+   * - sets req.user + req.orgId
+   */
+  app.decorate("authenticate", async (req: FastifyRequest, reply: FastifyReply) => {
+    return requireAuth(req, reply);
+  });
+
+  /**
+   * ✅ Optional auth (use only when route should work logged-out too)
+   * - JWT optional
+   * - if header org exists, must match token org
+   * - sets req.user + req.orgId when token is present
+   */
+  app.decorate("optionalAuthenticate", async (req: FastifyRequest, reply: FastifyReply) => {
+    return optionalAuth(req, reply);
+  });
+});
+----- src/middleware/auth.ts -----
+// src/middleware/auth.ts
+import type { FastifyReply, FastifyRequest } from "fastify";
+
+/**
+ * Normalized user object we attach to req.user
+ */
+export type AuthUser = {
+  userId: string;
+  organizationId: string;
+  role: "tenant" | "landlord" | "agent" | "admin";
+  email?: string;
+};
+
+const ALLOWED_ROLES = new Set<AuthUser["role"]>(["tenant", "landlord", "agent", "admin"]);
+
+/**
+ * Raw JWT payload can vary depending on what you sign:
+ * - Some code uses { sub, org, role }
+ * - Some uses { userId, organizationId, role }
+ */
+type RawJwtPayload = Partial<{
+  userId: string;
+  organizationId: string;
+  role: string; // keep raw as string; we validate into AuthUser["role"]
+  email: string;
+
+  // common JWT-style fields
+  sub: string;
+  org: string;
+
+  iat: number;
+  exp: number;
+}>;
+
+function getBearerToken(req: FastifyRequest): string | null {
+  const header = req.headers.authorization;
+  if (!header) return null;
+
+  const [type, token] = header.trim().split(/\s+/);
+  if (type?.toLowerCase() !== "bearer" || !token) return null;
+
+  return token.trim();
+}
+
+function normalizeJwtPayload(raw: RawJwtPayload): AuthUser | null {
+  const userId = (raw.userId ?? raw.sub ?? "").trim();
+  const organizationId = (raw.organizationId ?? raw.org ?? "").trim();
+  const roleRaw = (raw.role ?? "").trim();
+
+  if (!userId || !organizationId || !roleRaw) return null;
+  if (!ALLOWED_ROLES.has(roleRaw as AuthUser["role"])) return null;
+
+  return {
+    userId,
+    organizationId,
+    role: roleRaw as AuthUser["role"],
+    email: raw.email ? String(raw.email) : undefined,
+  };
+}
+
+function getOrgHeader(req: FastifyRequest): string {
+  return String(req.headers["x-organization-id"] ?? "").trim();
+}
+
+/**
+ * Enforce org rules and attach req.orgId.
+ */
+function enforceOrg(
+  req: FastifyRequest,
+  reply: FastifyReply,
+  user: AuthUser,
+  opts: { requireHeader: boolean }
+): boolean {
+  const headerOrg = getOrgHeader(req);
+
+  // For protected routes: header MUST exist
+  if (opts.requireHeader && !headerOrg) {
+    reply.code(400).send({
+      ok: false,
+      error: "ORG_REQUIRED",
+      message: "x-organization-id required",
+    });
+    return false;
+  }
+
+  // If header present, it MUST match token org (spoof protection)
+  if (headerOrg && headerOrg !== user.organizationId) {
+    reply.code(403).send({
+      ok: false,
+      error: "FORBIDDEN",
+      message: "Token org does not match x-organization-id",
+    });
+    return false;
+  }
+
+  // Effective org
+  (req as any).orgId = headerOrg || user.organizationId;
+  return true;
+}
+
+/**
+ * ✅ ADD THIS: Back-compat for older code (withRlsTransaction etc.)
+ * Some helpers still look at req.rls.userId / req.auth.userId / req.user.sub.
+ */
+function attachCompatAuthFields(req: FastifyRequest, user: AuthUser) {
+  const orgId = String((req as any).orgId ?? user.organizationId).trim();
+
+  // Keep your normalized user
+  (req as any).user = user;
+
+  // Back-compat fields (safe to add even if unused)
+  (req as any).rls = { userId: user.userId, organizationId: orgId };
+  (req as any).auth = { userId: user.userId, sub: user.userId };
+
+  // Some legacy code expects these on req.user
+  (req as any).user.sub = user.userId;
+  (req as any).user.org = orgId;
+}
+
+/**
+ * Must be logged in (valid JWT).
+ * ✅ Requires x-organization-id and enforces match with token org.
+ * ✅ Attaches req.user and req.orgId.
+ */
+export async function requireAuth(req: FastifyRequest, reply: FastifyReply) {
+  try {
+    const raw = (await (req as any).jwtVerify()) as RawJwtPayload;
+
+    const user = normalizeJwtPayload(raw);
+    if (!user) {
+      return reply.code(401).send({
+        ok: false,
+        error: "UNAUTHORIZED",
+        message: "Invalid token payload",
+      });
+    }
+
+    (req as any).user = user;
+
+    if (!enforceOrg(req, reply, user, { requireHeader: true })) return;
+
+    // ✅ ADD THIS (after org enforcement succeeds)
+    attachCompatAuthFields(req, user);
+  } catch {
+    return reply.code(401).send({
+      ok: false,
+      error: "UNAUTHORIZED",
+      message: "Invalid or missing token",
+    });
+  }
+}
+
+/**
+ * If token exists, verify it and attach req.user + req.orgId.
+ * ✅ If header org exists, it must match token org.
+ * ✅ If header missing, fall back to token org (keeps it truly optional).
+ */
+export async function optionalAuth(req: FastifyRequest, reply: FastifyReply) {
+  const token = getBearerToken(req);
+  if (!token) return;
+
+  try {
+    const raw = (await (req as any).jwtVerify()) as RawJwtPayload;
+
+    const user = normalizeJwtPayload(raw);
+    if (!user) {
+      return reply.code(401).send({
+        ok: false,
+        error: "UNAUTHORIZED",
+        message: "Invalid token payload",
+      });
+    }
+
+    (req as any).user = user;
+
+    if (!enforceOrg(req, reply, user, { requireHeader: false })) return;
+
+    // ✅ ADD THIS
+    attachCompatAuthFields(req, user);
+  } catch {
+    return reply.code(401).send({
+      ok: false,
+      error: "UNAUTHORIZED",
+      message: "Invalid token",
+    });
+  }
+}
+
+/**
+ * Role guard factory.
+ */
+export function requireRole(...roles: AuthUser["role"][]) {
+  return async function roleGuard(req: FastifyRequest, reply: FastifyReply) {
+    const user = (req as any).user as AuthUser | undefined;
+
+    if (!user) {
+      return reply.code(401).send({
+        ok: false,
+        error: "UNAUTHORIZED",
+        message: "Login required",
+      });
+    }
+
+    if (!roles.includes(user.role)) {
+      return reply.code(403).send({
+        ok: false,
+        error: "FORBIDDEN",
+        message: "You do not have permission to access this resource",
+      });
+    }
+  };
+}
+
+export const requireAdmin = [requireAuth, requireRole("admin")];
+----- src/types/fastify.d.ts -----
+// src/types/fastify.d.ts
+import "fastify";
+import "@fastify/jwt";
+
+import type { FastifyReply, FastifyRequest } from "fastify";
+import type { AuthUser } from "../middleware/auth.js";
+import type { JwtPayload } from "../plugins/jwt.js";
+
+declare module "@fastify/jwt" {
+  interface FastifyJWT {
+    payload: JwtPayload;
+    user: JwtPayload; // what req.jwtVerify() sets internally
+  }
+}
+
+declare module "fastify" {
+  interface FastifyInstance {
+    /**
+     * Decorated by src/plugins/jwt.ts
+     * These enforce org header + token validity (via requireAuth/optionalAuth)
+     */
+    authenticate: (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
+    optionalAuthenticate: (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
+  }
+
+  interface FastifyRequest {
+    /**
+     * Normalized identity set by your middleware/auth.ts (requireAuth/optionalAuth)
+     */
+    user?: AuthUser;
+
+    /**
+     * Effective org ID set by middleware/auth.ts
+     * Routes should trust ONLY this (not headers directly).
+     */
+    orgId?: string;
+
+    /**
+     * Legacy/optional fields (keep only if still used elsewhere)
+     */
+    rls?: {
+      userId?: string;
+      organizationId?: string;
+    };
+
+    auth?: {
+      userId?: string;
+      sub?: string;
+    };
+  }
+}
+
+export {};
+==================== 4) Where authenticate/optionalAuthenticate are referenced ====================
+src/types/fastify.d.ts:22:    authenticate: (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
+src/types/fastify.d.ts:23:    optionalAuthenticate: (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
+src/plugins/jwt.ts:26:  app.decorate("authenticate", async (req: FastifyRequest, reply: FastifyReply) => {
+src/plugins/jwt.ts:36:  app.decorate("optionalAuthenticate", async (req: FastifyRequest, reply: FastifyReply) => {
+src/routes/demo.ts:12:    { preHandler: [app.authenticate] },
+src/routes/organizations.ts:51:    { preHandler: [app.authenticate] },
+src/routes/organizations.ts:71:    { preHandler: [app.authenticate] },
+src/routes/purchases.routes.ts:36:  // ✅ ONLY trust orgId set by fastify.authenticate middleware
+src/routes/purchases.routes.ts:106:  fastify.get("/purchases", { preHandler: [fastify.authenticate] }, async (request, reply) => {
+src/routes/purchases.routes.ts:172:    { preHandler: [fastify.authenticate] },
+src/routes/purchases.routes.ts:250:    { preHandler: [fastify.authenticate] },
+src/routes/purchases.routes.ts:299:      preHandler: [fastify.authenticate],
+src/routes/purchases.routes.ts:355:      preHandler: [fastify.authenticate],
+src/routes/purchases.routes.ts:438:      preHandler: [fastify.authenticate],
+src/routes/purchases.routes.ts:542:      preHandler: [fastify.authenticate],
+src/routes/purchases.routes.ts:729:      preHandler: [fastify.authenticate],
+src/routes/tenancies.ts:53:    { preHandler: [app.authenticate] },
+src/routes/tenancies.ts:81:    { preHandler: [app.authenticate] },
+src/routes/tenancies.ts:113:    { preHandler: [app.authenticate] },
+src/routes/tenancies.ts:140:    { preHandler: [app.authenticate] },
+src/routes/rent_invoices.ts:22:  const orgId = String(req.orgId ?? "").trim(); // ✅ set by app.authenticate
+src/routes/rent_invoices.ts:95:    { preHandler: [app.authenticate] },
+src/routes/rent_invoices.ts:163:  app.get("/rent-invoices", { preHandler: [app.authenticate] }, async (req, reply) => {
+src/routes/rent_invoices.ts:218:  app.post("/rent-invoices/:id/pay", { preHandler: [app.authenticate] }, async (req, reply) => {
+src/routes/applications.ts:83:  app.get("/applications", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/applications.ts:108:  app.get("/applications/:id", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/applications.ts:125:  app.post("/applications", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/applications.ts:157:  app.patch("/applications/:id", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/viewings.ts:9:  app.get("/viewings", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/viewings.ts:28:  app.get("/viewings/:id", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/viewings.ts:40:  app.post("/viewings", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/viewings.ts:62:  app.patch("/viewings/:id", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/properties.ts:21:    { preHandler: [app.authenticate] },
+src/routes/properties.ts:48:    { preHandler: [app.authenticate] },
+src/routes/properties.ts:79:    { preHandler: [app.authenticate] },
+src/routes/properties.ts:103:    { preHandler: [app.authenticate] },
+src/routes/listings.ts:14:  app.get("/listings", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/listings.ts:31:  app.get("/listings/:id", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/listings.ts:46:  app.post("/listings", { preHandler: [app.authenticate] }, async (req, reply) => {
+src/routes/listings.ts:96:  app.patch("/listings/:id", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/me.ts:6:  app.get("/me", { preHandler: [app.authenticate] }, async (req) => {
+
+==================== 5) Routes list + all preHandler usage ====================
+applications.ts
+auth.ts
+demo.ts
+health.ts
+index.ts
+listings.ts
+me.ts
+organizations.ts
+properties.ts
+purchases.routes.ts
+rent_invoices.ts
+tenancies.ts
+viewings.ts
+
+src/routes/demo.ts:5:  app.get("/demo/public", async () => {
+src/routes/demo.ts:10:  app.get(
+src/routes/demo.ts:12:    { preHandler: [app.authenticate] },
+src/routes/organizations.ts:49:  app.get(
+src/routes/organizations.ts:51:    { preHandler: [app.authenticate] },
+src/routes/organizations.ts:69:  app.put(
+src/routes/organizations.ts:71:    { preHandler: [app.authenticate] },
+src/routes/purchases.routes.ts:106:  fastify.get("/purchases", { preHandler: [fastify.authenticate] }, async (request, reply) => {
+src/routes/purchases.routes.ts:172:    { preHandler: [fastify.authenticate] },
+src/routes/purchases.routes.ts:250:    { preHandler: [fastify.authenticate] },
+src/routes/purchases.routes.ts:299:      preHandler: [fastify.authenticate],
+src/routes/purchases.routes.ts:355:      preHandler: [fastify.authenticate],
+src/routes/purchases.routes.ts:438:      preHandler: [fastify.authenticate],
+src/routes/purchases.routes.ts:542:      preHandler: [fastify.authenticate],
+src/routes/purchases.routes.ts:729:      preHandler: [fastify.authenticate],
+src/routes/tenancies.ts:53:    { preHandler: [app.authenticate] },
+src/routes/tenancies.ts:81:    { preHandler: [app.authenticate] },
+src/routes/tenancies.ts:113:    { preHandler: [app.authenticate] },
+src/routes/tenancies.ts:140:    { preHandler: [app.authenticate] },
+src/routes/rent_invoices.ts:93:  app.post(
+src/routes/rent_invoices.ts:95:    { preHandler: [app.authenticate] },
+src/routes/rent_invoices.ts:163:  app.get("/rent-invoices", { preHandler: [app.authenticate] }, async (req, reply) => {
+src/routes/rent_invoices.ts:218:  app.post("/rent-invoices/:id/pay", { preHandler: [app.authenticate] }, async (req, reply) => {
+src/routes/applications.ts:83:  app.get("/applications", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/applications.ts:108:  app.get("/applications/:id", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/applications.ts:125:  app.post("/applications", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/applications.ts:157:  app.patch("/applications/:id", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/health.ts:4:  app.get("/health", async () => {
+src/routes/viewings.ts:9:  app.get("/viewings", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/viewings.ts:28:  app.get("/viewings/:id", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/viewings.ts:40:  app.post("/viewings", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/viewings.ts:62:  app.patch("/viewings/:id", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/properties.ts:19:  app.post(
+src/routes/properties.ts:21:    { preHandler: [app.authenticate] },
+src/routes/properties.ts:46:  app.get(
+src/routes/properties.ts:48:    { preHandler: [app.authenticate] },
+src/routes/properties.ts:77:  app.get(
+src/routes/properties.ts:79:    { preHandler: [app.authenticate] },
+src/routes/properties.ts:101:  app.patch(
+src/routes/properties.ts:103:    { preHandler: [app.authenticate] },
+src/routes/listings.ts:14:  app.get("/listings", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/listings.ts:31:  app.get("/listings/:id", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/listings.ts:46:  app.post("/listings", { preHandler: [app.authenticate] }, async (req, reply) => {
+src/routes/listings.ts:96:  app.patch("/listings/:id", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/me.ts:6:  app.get("/me", { preHandler: [app.authenticate] }, async (req) => {
+src/routes/auth.ts:14:  app.post("/auth/register", async (req, reply) => {
+src/routes/auth.ts:55:  app.post("/auth/login", async (req, reply) => {
+
+==================== 6) Full route files (auth, rent_invoices, purchases, tenancies, payments/webhooks if any) ====================
+
+----- src/routes/auth.ts -----
+// src/routes/auth.ts
+import type { FastifyInstance } from "fastify";
+import { registerSchema, loginSchema } from "../schemas/auth.schema.js";
+import { hashPassword, verifyPassword } from "../shared/utils/password.js";
+import {
+  createUser,
+  getUserByEmail,
+  markLoginFailure,
+  markLoginSuccess,
+} from "../repositories/users.repo.js";
+
+export async function authRoutes(app: FastifyInstance) {
+  // Register
+  app.post("/auth/register", async (req, reply) => {
+    const body = registerSchema.parse(req.body);
+
+    const passwordHash = await hashPassword(body.password);
+
+    try {
+      const user = await createUser({
+        organizationId: body.organizationId,
+        fullName: body.fullName,
+        email: body.email.toLowerCase(),
+        phone: body.phone,
+        passwordHash,
+        role: body.role,
+      });
+
+      const token = app.jwt.sign({
+        sub: user.id,
+        org: String(user.organization_id ?? ""),
+        role: user.role,
+        email: user.email,
+      });
+
+      return reply.code(201).send({
+        ok: true,
+        token,
+        user,
+      });
+    } catch (err: any) {
+      // unique violation in Postgres
+      if (err?.code === "23505") {
+        return reply.code(409).send({
+          ok: false,
+          error: "EMAIL_EXISTS",
+          message: "Email already registered",
+        });
+      }
+      throw err;
+    }
+  });
+
+  // Login
+  app.post("/auth/login", async (req, reply) => {
+    const body = loginSchema.parse(req.body);
+
+    const user = await getUserByEmail(body.email.toLowerCase());
+    if (!user) {
+      return reply
+        .code(401)
+        .send({ ok: false, error: "UNAUTHORIZED", message: "Invalid credentials" });
+    }
+
+    // ✅ 0) permanent lock check
+    if (user.account_locked_permanent) {
+      return reply.code(423).send({
+        ok: false,
+        error: "ACCOUNT_LOCKED",
+        message: "Account locked. Contact support.",
+      });
+    }
+
+    // ✅ 1) temp lock check
+    if (user.account_locked_until) {
+      const lockedUntil = new Date(user.account_locked_until);
+      if (lockedUntil.getTime() > Date.now()) {
+        return reply.code(423).send({
+          ok: false,
+          error: "ACCOUNT_LOCKED",
+          message: "Too many attempts. Try again in 5 minutes.",
+          lockedUntil,
+        });
+      }
+      // if expired, allow login attempt (repo handles stage escalation on next wrong)
+    }
+
+    const ok = await verifyPassword(body.password, user.password_hash);
+
+    if (!ok) {
+      const { attempts, lockedUntil, permanentlyLocked } = await markLoginFailure(
+        user.id
+      );
+
+      // ✅ permanent lock just triggered
+      if (permanentlyLocked) {
+        return reply.code(423).send({
+          ok: false,
+          error: "ACCOUNT_LOCKED",
+          message: "Account locked. Contact support.",
+        });
+      }
+
+      // ✅ temp lock just triggered (3rd wrong)
+      if (lockedUntil) {
+        return reply.code(423).send({
+          ok: false,
+          error: "ACCOUNT_LOCKED",
+          message: "Too many attempts. Try again in 5 minutes.",
+          attempts,
+          lockedUntil,
+        });
+      }
+
+      // normal wrong attempt (1st/2nd)
+      return reply.code(401).send({
+        ok: false,
+        error: "UNAUTHORIZED",
+        message: "Invalid credentials",
+        attempts,
+      });
+    }
+
+    // ✅ success resets attempts + locks + stage
+    await markLoginSuccess(user.id);
+
+    const token = app.jwt.sign({
+      sub: user.id,
+      org: String(user.organization_id ?? ""),
+      role: user.role,
+      email: user.email,
+    });
+
+    return reply.send({
+      ok: true,
+      token,
+      user: {
+        id: user.id,
+        organization_id: user.organization_id,
+        full_name: user.full_name,
+        email: user.email,
+        phone: user.phone,
+        role: user.role,
+        verified_status: user.verified_status,
+      },
+    });
+  });
+}
+----- src/routes/rent_invoices.ts -----
+// src/routes/rent_invoices.ts
+import type { FastifyInstance } from "fastify";
+import type { PoolClient } from "pg";
+import { z } from "zod";
+
+import {
+  generateRentInvoiceForTenancy,
+  getRentInvoices,
+  payRentInvoice,
+} from "../services/rent_invoices.service.js";
+
+import {
+  GenerateRentInvoiceBodySchema,
+  ListRentInvoicesQuerySchema,
+  PayRentInvoiceBodySchema,
+} from "../schemas/rent_invoices.schema.js";
+
+// -------------------------------
+// Helpers (✅ trust middleware only)
+// -------------------------------
+function requireOrgId(req: any, reply: any): string | null {
+  const orgId = String(req.orgId ?? "").trim(); // ✅ set by app.authenticate
+  if (!orgId) {
+    reply.code(400).send({
+      ok: false,
+      error: "ORG_REQUIRED",
+      message: "x-organization-id required",
+    });
+    return null;
+  }
+  return orgId;
+}
+
+function requireUserId(req: any, reply: any): string | null {
+  const userId = String(req.user?.userId ?? "").trim(); // ✅ normalized by auth middleware
+  if (!userId) {
+    reply.code(401).send({
+      ok: false,
+      error: "UNAUTHORIZED",
+      message: "Missing authenticated user",
+    });
+    return null;
+  }
+  return userId;
+}
+
+async function fetchDbRole(client: PoolClient, userId: string) {
+  const roleRes = await client.query<{ role: string }>(
+    "select role from public.users where id = $1::uuid limit 1;",
+    [userId]
+  );
+  return roleRes.rows[0]?.role ?? null;
+}
+
+/**
+ * ✅ DB context setter
+ * Uses ONLY:
+ * - req.orgId (resolved & org-matched)
+ * - req.user.userId (normalized)
+ * - req.user.role (normalized, but we can refresh from DB)
+ */
+async function applyDbContext(client: PoolClient, req: any) {
+  const orgId = String(req.orgId ?? "").trim();
+  const userId = String(req.user?.userId ?? "").trim();
+  const role = String(req.user?.role ?? "").trim();
+
+  if (!orgId) {
+    const e: any = new Error("Missing resolved organization id (req.orgId)");
+    e.code = "ORG_ID_MISSING";
+    throw e;
+  }
+  if (!userId) {
+    const e: any = new Error("Missing authenticated user id (req.user.userId)");
+    e.code = "USER_ID_MISSING";
+    throw e;
+  }
+
+  await client.query("SELECT set_config('request.header.x_organization_id', $1, true);", [orgId]);
+  await client.query("SELECT set_config('app.organization_id', $1, true);", [orgId]);
+
+  await client.query("SELECT set_config('request.jwt.claim.sub', $1, true);", [userId]);
+  await client.query("SELECT set_config('app.user_id', $1, true);", [userId]);
+
+  await client.query("SELECT set_config('request.user_role', $1, true);", [role]);
+  await client.query("SELECT set_config('app.user_role', $1, true);", [role]);
+  await client.query("SELECT set_config('rentease.user_role', $1, true);", [role]);
+}
+
+export async function rentInvoicesRoutes(app: FastifyInstance) {
+  // ------------------------------------------------------------
+  // POST /tenancies/:id/rent-invoices/generate
+  // ------------------------------------------------------------
+  app.post(
+    "/tenancies/:id/rent-invoices/generate",
+    { preHandler: [app.authenticate] },
+    async (req, reply) => {
+      try {
+        const orgId = requireOrgId(req, reply);
+        const userId = requireUserId(req, reply);
+        if (!orgId || !userId) return;
+
+        const params = z.object({ id: z.string().uuid() }).parse((req as any).params);
+        const body = GenerateRentInvoiceBodySchema.parse((req as any).body);
+
+        const pgAny: any = (app as any).pg;
+        if (!pgAny?.connect) {
+          return reply.code(500).send({
+            ok: false,
+            error: "PG_NOT_CONFIGURED",
+            message: "Fastify pg plugin not found at app.pg",
+          });
+        }
+
+        const client = (await pgAny.connect()) as PoolClient;
+        try {
+          // Optional: refresh role from DB
+          const dbRole = await fetchDbRole(client, userId);
+          (req as any).user.role = (dbRole ?? (req as any).user.role) as any;
+
+          await applyDbContext(client, req);
+          await client.query("BEGIN");
+
+          const res = await generateRentInvoiceForTenancy(client, {
+            organizationId: orgId,
+            tenancyId: params.id,
+            periodStart: body.periodStart,
+            periodEnd: body.periodEnd,
+            dueDate: body.dueDate,
+            subtotal: body.subtotal,
+            lateFeeAmount: body.lateFeeAmount,
+            currency: body.currency,
+            status: body.status,
+            notes: body.notes,
+          });
+
+          await client.query("COMMIT");
+          return reply.send({ ok: true, reused: res.reused, data: res.row });
+        } catch (err: any) {
+          try {
+            await client.query("ROLLBACK");
+          } catch {}
+          return reply.code(500).send({
+            ok: false,
+            error: err?.code ?? "INTERNAL_ERROR",
+            message: err?.message ?? String(err),
+          });
+        } finally {
+          client.release();
+        }
+      } catch (err: any) {
+        return reply.code(400).send({
+          ok: false,
+          error: err?.code ?? "BAD_REQUEST",
+          message: err?.message ?? String(err),
+        });
+      }
+    }
+  );
+
+  // ------------------------------------------------------------
+  // GET /rent-invoices
+  // ------------------------------------------------------------
+  app.get("/rent-invoices", { preHandler: [app.authenticate] }, async (req, reply) => {
+    try {
+      const orgId = requireOrgId(req, reply);
+      const userId = requireUserId(req, reply);
+      if (!orgId || !userId) return;
+
+      const q = ListRentInvoicesQuerySchema.parse((req as any).query);
+
+      const pgAny: any = (app as any).pg;
+      if (!pgAny?.connect) {
+        return reply.code(500).send({
+          ok: false,
+          error: "PG_NOT_CONFIGURED",
+          message: "Fastify pg plugin not found at app.pg",
+        });
+      }
+
+      const client = (await pgAny.connect()) as PoolClient;
+      try {
+        const dbRole = await fetchDbRole(client, userId);
+        (req as any).user.role = (dbRole ?? (req as any).user.role) as any;
+
+        await applyDbContext(client, req);
+
+        const data = await getRentInvoices(client, {
+          limit: q.limit,
+          offset: q.offset,
+          tenancyId: q.tenancyId,
+          tenantId: q.tenantId,
+          propertyId: q.propertyId,
+          status: q.status,
+        });
+
+        return reply.send({ ok: true, data, paging: { limit: q.limit, offset: q.offset } });
+      } catch (err: any) {
+        return reply.code(500).send({
+          ok: false,
+          error: err?.code ?? "INTERNAL_ERROR",
+          message: err?.message ?? String(err),
+        });
+      } finally {
+        client.release();
+      }
+    } catch (err: any) {
+      return reply.code(400).send({
+        ok: false,
+        error: err?.code ?? "BAD_REQUEST",
+        message: err?.message ?? String(err),
+      });
+    }
+  });
+
+  // ------------------------------------------------------------
+  // POST /rent-invoices/:id/pay (admin-only for now)
+  // ------------------------------------------------------------
+  app.post("/rent-invoices/:id/pay", { preHandler: [app.authenticate] }, async (req, reply) => {
+    const orgId = requireOrgId(req, reply);
+    const userId = requireUserId(req, reply);
+    if (!orgId || !userId) return;
+
+    const pgAny: any = (app as any).pg;
+    if (!pgAny?.connect) {
+      return reply.code(500).send({
+        ok: false,
+        error: "PG_NOT_CONFIGURED",
+        message: "Fastify pg plugin not found at app.pg",
+      });
+    }
+
+    const params = z.object({ id: z.string().uuid() }).parse((req as any).params);
+    const body = PayRentInvoiceBodySchema.parse((req as any).body);
+
+    const client = (await pgAny.connect()) as PoolClient;
+    try {
+      const dbRole = await fetchDbRole(client, userId);
+      (req as any).user.role = (dbRole ?? (req as any).user.role) as any;
+
+      await applyDbContext(client, req);
+
+      if (dbRole !== "admin") {
+        return reply.code(403).send({ ok: false, error: "FORBIDDEN", message: "Admin only for now." });
+      }
+
+      await client.query("BEGIN");
+
+      const res = await payRentInvoice(client, {
+        invoiceId: params.id,
+        paymentMethod: String(body.paymentMethod),
+        amount: body.amount ?? null,
+      });
+
+      await client.query("COMMIT");
+      return reply.send({ ok: true, alreadyPaid: res.alreadyPaid, data: res.row });
+    } catch (err: any) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+      return reply.code(500).send({
+        ok: false,
+        error: err?.code ?? "INTERNAL_ERROR",
+        message: err?.message ?? String(err),
+      });
+    } finally {
+      client.release();
+    }
+  });
+}
+----- src/routes/purchases.routes.ts -----
+// src/routes/purchases.routes.ts
+import type { FastifyInstance } from "fastify";
+import { setPgContext } from "../db/set_pg_context.js";
+import { payPropertyPurchase } from "../services/purchase_payments.service.js";
+import { refundPropertyPurchase } from "../services/purchase_refunds.service.js";
+
+type PurchaseRow = {
+  id: string;
+  organization_id: string;
+  property_id: string;
+  listing_id: string | null;
+  buyer_id: string;
+  seller_id: string;
+  agreed_price: string;
+  currency: string;
+
+  status: string;
+  payment_status: string;
+
+  deposit_amount: number | null;
+  earnest_deposit_amount?: number | null;
+
+  escrow_wallet_account_id?: string | null;
+  escrow_held_amount?: number | null;
+  escrow_released_amount?: number | null;
+  escrow_released_at?: string | null;
+
+  paid_at?: string | null;
+  refunded_at?: string | null;
+
+  created_at: string;
+  updated_at: string;
+};
+
+function getOrgIdFromReq(request: any): string {
+  // ✅ ONLY trust orgId set by fastify.authenticate middleware
+  return String(request.orgId || "").trim();
+}
+
+function requireOrgId(request: any, reply: any): string | null {
+  const orgId = getOrgIdFromReq(request);
+  if (!orgId) {
+    reply.code(400).send({ ok: false, error: "ORG_REQUIRED", message: "Organization not resolved" });
+    return null;
+  }
+  return orgId;
+}
+
+async function fetchPurchaseOr404(client: any, purchaseId: string, orgId: string) {
+  const { rows } = await client.query(
+    `
+    select
+      pp.id::text,
+      pp.organization_id::text,
+      pp.property_id::text,
+      pp.listing_id::text as listing_id,
+      pp.buyer_id::text,
+      pp.seller_id::text,
+      pp.agreed_price::text as agreed_price,
+      pp.currency,
+      pp.status::text as status,
+      pp.payment_status::text as payment_status,
+
+      pp.deposit_amount::numeric as deposit_amount,
+      pp.earnest_deposit_amount::numeric as earnest_deposit_amount,
+
+      pp.escrow_wallet_account_id::text as escrow_wallet_account_id,
+      pp.escrow_held_amount::numeric as escrow_held_amount,
+      pp.escrow_released_amount::numeric as escrow_released_amount,
+      pp.escrow_released_at::text as escrow_released_at,
+
+      pp.paid_at::text as paid_at,
+      pp.refunded_at::text as refunded_at,
+      pp.created_at::text as created_at,
+      pp.updated_at::text as updated_at
+    from public.property_purchases pp
+    where pp.id = $1::uuid
+      and pp.organization_id = $2::uuid
+      and pp.deleted_at is null
+    limit 1;
+    `,
+    [purchaseId, orgId]
+  );
+
+  const purchase = rows[0] as PurchaseRow | undefined;
+  return purchase ?? null;
+}
+
+async function setEventNote(client: any, note: unknown) {
+  const clean = typeof note === "string" ? note.trim() : "";
+  if (clean.length > 0) {
+    await client.query("select set_config('app.event_note', $1, true)", [clean]);
+  } else {
+    await client.query("select set_config('app.event_note', '', true)");
+  }
+}
+
+function escrowInvariantError(reply: any, error: string, message: string) {
+  return reply.code(400).send({ ok: false, error, message });
+}
+
+export default async function purchasesRoutes(fastify: FastifyInstance) {
+  // ------------------------------------------------------------
+  // GET /purchases (list) ✅ protected
+  // ------------------------------------------------------------
+  fastify.get("/purchases", { preHandler: [fastify.authenticate] }, async (request, reply) => {
+    const orgId = requireOrgId(request, reply);
+    if (!orgId) return;
+
+    const client = await fastify.pg.connect();
+    try {
+      const { rows } = await client.query(
+        `
+        select
+          pp.id::text as id,
+          pp.organization_id::text as organization_id,
+          pp.property_id::text as property_id,
+          pp.listing_id::text as listing_id,
+          pp.buyer_id::text as buyer_id,
+          pp.seller_id::text as seller_id,
+          pp.agreed_price::text as agreed_price,
+          pp.currency,
+          pp.status::text as status,
+          pp.payment_status::text as payment_status,
+          pp.paid_at::text as paid_at,
+          pp.paid_amount::text as paid_amount,
+          pp.refunded_at::text as refunded_at,
+          pp.refunded_amount::text as refunded_amount,
+
+          pp.deposit_amount::text as deposit_amount,
+
+          pp.escrow_wallet_account_id::text as escrow_wallet_account_id,
+          pp.escrow_held_amount::text as escrow_held_amount,
+          pp.escrow_released_amount::text as escrow_released_amount,
+          pp.escrow_released_at::text as escrow_released_at,
+
+          pp.created_at::text as created_at,
+          pp.updated_at::text as updated_at,
+
+          exists (
+            select 1 from public.property_purchase_payments ppp
+            where ppp.purchase_id = pp.id
+          ) as has_payment_link,
+
+          (
+            select count(*)
+            from public.wallet_transactions wt
+            where wt.reference_type='purchase'
+              and wt.reference_id=pp.id
+          ) as ledger_txn_count
+
+        from public.property_purchases pp
+        where pp.organization_id = $1::uuid
+          and pp.deleted_at is null
+        order by pp.created_at desc
+        limit 50;
+        `,
+        [orgId]
+      );
+
+      return reply.send({ ok: true, data: rows });
+    } finally {
+      client.release();
+    }
+  });
+
+  // ------------------------------------------------------------
+  // GET /purchases/:purchaseId (detail) ✅ protected
+  // ------------------------------------------------------------
+  fastify.get<{ Params: { purchaseId: string } }>(
+    "/purchases/:purchaseId",
+    { preHandler: [fastify.authenticate] },
+    async (request, reply) => {
+      const orgId = requireOrgId(request, reply);
+      if (!orgId) return;
+
+      const { purchaseId } = request.params;
+
+      const client = await fastify.pg.connect();
+      try {
+        const { rows } = await client.query(
+          `
+          select
+            pp.*,
+            pp.id::text as id,
+            pp.organization_id::text as organization_id,
+            pp.property_id::text as property_id,
+            pp.listing_id::text as listing_id,
+            pp.buyer_id::text as buyer_id,
+            pp.seller_id::text as seller_id,
+
+            pp.status::text as status_text,
+            pp.payment_status::text as payment_status_text,
+
+            pp.escrow_wallet_account_id::text as escrow_wallet_account_id,
+
+            coalesce((
+              select jsonb_agg(jsonb_build_object(
+                'payment_id', p.id::text,
+                'amount', p.amount,
+                'currency', p.currency,
+                'status', p.status::text,
+                'transaction_reference', p.transaction_reference,
+                'created_at', p.created_at
+              ) order by p.created_at desc)
+              from public.property_purchase_payments link
+              join public.payments p on p.id = link.payment_id
+              where link.purchase_id = pp.id
+            ), '[]'::jsonb) as payments,
+
+            coalesce((
+              select jsonb_agg(jsonb_build_object(
+                'txn_type', wt.txn_type::text,
+                'amount', wt.amount,
+                'currency', wt.currency,
+                'note', wt.note,
+                'created_at', wt.created_at
+              ) order by wt.created_at asc)
+              from public.wallet_transactions wt
+              where wt.reference_type='purchase'
+                and wt.reference_id=pp.id
+            ), '[]'::jsonb) as ledger
+
+          from public.property_purchases pp
+          where pp.id = $1::uuid
+            and pp.organization_id = $2::uuid
+            and pp.deleted_at is null
+          limit 1;
+          `,
+          [purchaseId, orgId]
+        );
+
+        const row = rows[0];
+        if (!row) {
+          return reply.code(404).send({ ok: false, error: "NOT_FOUND", message: "Purchase not found" });
+        }
+
+        return reply.send({ ok: true, data: row });
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  // ------------------------------------------------------------
+  // GET /purchases/:purchaseId/events (timeline) ✅ protected
+  // ------------------------------------------------------------
+  fastify.get<{ Params: { purchaseId: string } }>(
+    "/purchases/:purchaseId/events",
+    { preHandler: [fastify.authenticate] },
+    async (request, reply) => {
+      const orgId = requireOrgId(request, reply);
+      if (!orgId) return;
+
+      const actorUserId = (request as any).user?.userId ?? null;
+      const { purchaseId } = request.params;
+
+      const client = await fastify.pg.connect();
+      try {
+        await setPgContext(client, { userId: actorUserId, organizationId: orgId });
+
+        const { rows } = await client.query(
+          `
+          select
+            id::text as id,
+            event_type::text as event_type,
+            actor_user_id::text as actor_user_id,
+            from_status,
+            to_status,
+            note,
+            metadata,
+            (metadata->>'event_note') as event_note,
+            created_at::text as created_at
+          from public.purchase_events
+          where organization_id = $1::uuid
+            and purchase_id = $2::uuid
+          order by created_at desc
+          limit 100;
+          `,
+          [orgId, purchaseId]
+        );
+
+        return reply.send({ ok: true, data: rows });
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+  // ------------------------------------------------------------
+  // POST /purchases/:purchaseId/pay ✅ protected
+  // ------------------------------------------------------------
+  fastify.post<{
+    Params: { purchaseId: string };
+    Body: { paymentMethod: "card" | "bank_transfer" | "wallet"; amount?: number };
+  }>(
+    "/purchases/:purchaseId/pay",
+    {
+      preHandler: [fastify.authenticate],
+      schema: {
+        body: {
+          type: "object",
+          required: ["paymentMethod"],
+          additionalProperties: false,
+          properties: {
+            paymentMethod: { type: "string", enum: ["card", "bank_transfer", "wallet"] },
+            amount: { type: "number", minimum: 0 },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const orgId = requireOrgId(request, reply);
+      if (!orgId) return;
+
+      const actorUserId = (request as any).user?.userId ?? null;
+      const { purchaseId } = request.params;
+
+      const paymentMethod = request.body.paymentMethod;
+      const amount = request.body.amount;
+
+      const client = await fastify.pg.connect();
+      try {
+        await setPgContext(client, { userId: actorUserId, organizationId: orgId });
+
+        const result = await payPropertyPurchase(client, {
+          organizationId: orgId,
+          purchaseId,
+          paymentMethod,
+          amount: typeof amount === "number" ? amount : undefined,
+        });
+
+        return reply.send({ ok: true, data: result });
+      } catch (err: any) {
+        return reply.code(400).send({
+          ok: false,
+          error: err?.code || "PAY_FAILED",
+          message: err?.message || "Payment failed",
+        });
+      } finally {
+
+----- src/routes/tenancies.ts -----
+// src/routes/tenancies.ts
+import type { FastifyInstance, FastifyReply } from "fastify";
+
+import { withRlsTransaction } from "../db.js";
+import {
+  createTenancyBodySchema,
+  listTenanciesQuerySchema,
+  endTenancyParamsSchema,
+  endTenancyBodySchema,
+  startTenancyParamsSchema,
+  startTenancyBodySchema,
+  type CreateTenancyBody,
+  type ListTenanciesQuery,
+  type EndTenancyBody,
+  type EndTenancyParams,
+  type StartTenancyBody,
+  type StartTenancyParams,
+} from "../schemas/tenancies.schema.js";
+import { createTenancy, endTenancy, getTenancies, startTenancy } from "../services/tenancies.service.js";
+
+function getRlsCtx(req: any): { userId: string; organizationId: string } {
+  const userId = String(req?.user?.userId ?? "").trim();
+  const organizationId = String(req?.orgId ?? "").trim();
+
+  if (!userId) {
+    const err: any = new Error("Missing authenticated user");
+    err.code = "USER_ID_MISSING";
+    throw err;
+  }
+
+  if (!organizationId) {
+    const err: any = new Error("x-organization-id required");
+    err.code = "ORG_REQUIRED";
+    throw err;
+  }
+
+  return { userId, organizationId };
+}
+
+function handleCtxErrors(e: any, reply: FastifyReply) {
+  if (e?.code === "ORG_REQUIRED") {
+    return reply.code(400).send({ ok: false, error: "ORG_REQUIRED", message: "x-organization-id required" });
+  }
+  if (e?.code === "USER_ID_MISSING") {
+    return reply.code(401).send({ ok: false, error: "UNAUTHORIZED", message: "Missing authenticated user" });
+  }
+  return null;
+}
+
+export async function tenancyRoutes(app: FastifyInstance) {
+  app.get<{ Querystring: ListTenanciesQuery }>(
+    "/tenancies",
+    { preHandler: [app.authenticate] },
+    async (req, reply) => {
+      try {
+        const q = listTenanciesQuerySchema.parse(req.query ?? {});
+        const ctx = getRlsCtx(req);
+
+        const data = await withRlsTransaction(ctx, (client) =>
+          getTenancies(client, {
+            limit: q.limit,
+            offset: q.offset,
+            tenantId: q.tenantId,
+            propertyId: q.propertyId,
+            listingId: q.listingId,
+            status: q.status as any,
+          })
+        );
+
+        return { ok: true, data, paging: { limit: q.limit, offset: q.offset } };
+      } catch (e: any) {
+        const handled = handleCtxErrors(e, reply);
+        if (handled) return handled;
+        throw e;
+      }
+    }
+  );
+
+  app.post<{ Body: CreateTenancyBody }>(
+    "/tenancies",
+    { preHandler: [app.authenticate] },
+    async (req, reply) => {
+      try {
+        const body = createTenancyBodySchema.parse(req.body ?? {});
+        const ctx = getRlsCtx(req);
+
+        const result = await withRlsTransaction(ctx, (client) =>
+          createTenancy(client, {
+            tenantId: body.tenantId,
+            propertyId: body.propertyId,
+            listingId: body.listingId ?? null,
+            rentAmount: body.rentAmount,
+            securityDeposit: body.securityDeposit ?? null,
+            startDate: body.startDate,
+            nextDueDate: body.nextDueDate,
+            paymentCycle: (body.paymentCycle as any) ?? null,
+            status: (body.status as any) ?? null,
+            terminationReason: body.terminationReason ?? null,
+          })
+        );
+
+        return { ok: true, data: result.row, reused: result.reused, patched: result.patched };
+      } catch (e: any) {
+        const handled = handleCtxErrors(e, reply);
+        if (handled) return handled;
+        throw e;
+      }
+    }
+  );
+
+  app.patch<{ Params: EndTenancyParams; Body: EndTenancyBody }>(
+    "/tenancies/:id/end",
+    { preHandler: [app.authenticate] },
+    async (req, reply) => {
+      try {
+        const params = endTenancyParamsSchema.parse(req.params ?? {});
+        const body = endTenancyBodySchema.parse(req.body ?? {});
+        const ctx = getRlsCtx(req);
+
+        const result = await withRlsTransaction(ctx, (client) =>
+          endTenancy(client, {
+            id: params.id,
+            status: body.status,
+            endDate: body.endDate ?? null,
+            terminationReason: body.terminationReason ?? null,
+          })
+        );
+
+        return { ok: true, data: result.row, changed: result.changed };
+      } catch (e: any) {
+        const handled = handleCtxErrors(e, reply);
+        if (handled) return handled;
+        throw e;
+      }
+    }
+  );
+
+  app.patch<{ Params: StartTenancyParams; Body: StartTenancyBody }>(
+    "/tenancies/:id/start",
+    { preHandler: [app.authenticate] },
+    async (req, reply) => {
+      try {
+        const params = startTenancyParamsSchema.parse(req.params ?? {});
+        const body = startTenancyBodySchema.parse(req.body ?? {});
+        const ctx = getRlsCtx(req);
+
+        const result = await withRlsTransaction(ctx, (client) =>
+          startTenancy(client, {
+            id: params.id,
+            startDate: body.startDate ?? null,
+          })
+        );
+
+        return { ok: true, data: result.row, changed: result.changed };
+      } catch (e: any) {
+        const handled = handleCtxErrors(e, reply);
+        if (handled) return handled;
+        throw e;
+      }
+    }
+  );
+}
+----- src/routes/applications.ts -----
+import type { FastifyInstance } from "fastify";
+import type { PoolClient } from "pg";
+import { withRlsTransaction } from "../config/database.js";
+
+import {
+  createApplication,
+  getApplication,
+  listAllApplications,
+  updateApplication,
+} from "../services/applications.service.js";
+
+import {
+  createApplicationBodySchema,
+  listApplicationsQuerySchema,
+  patchApplicationBodySchema,
+} from "../schemas/applications.schema.js";
+
+/**
+ * INPUT: normalize anything into YYYY-MM-DD (no timezone).
+ * - accepts "YYYY-MM-DD"
+ * - accepts ISO strings -> trims to date part
+ * - accepts Date -> formats using LOCAL date parts (no UTC shift)
+ */
+function normalizeDateOnlyInput(v: unknown): string | null {
+  if (v === null || v === undefined) return null;
+
+  if (v instanceof Date && !Number.isNaN(v.getTime())) {
+    const y = v.getFullYear();
+    const m = String(v.getMonth() + 1).padStart(2, "0");
+    const d = String(v.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+
+  if (typeof v === "string") {
+    // ISO -> take date part
+    if (v.includes("T")) return v.slice(0, 10);
+    // already date-only
+    return v;
+  }
+
+  return null;
+}
+
+/**
+ * OUTPUT: force move_in_date to YYYY-MM-DD consistently.
+ * If pg gives Date object, format with LOCAL date parts to avoid -1 day shift.
+ */
+function toDateOnlyOutput(v: unknown): string | null {
+  if (v === null || v === undefined) return null;
+
+  if (v instanceof Date && !Number.isNaN(v.getTime())) {
+    const y = v.getFullYear();
+    const m = String(v.getMonth() + 1).padStart(2, "0");
+    const d = String(v.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+
+  if (typeof v === "string") {
+    // if ISO sneaks in, trim
+    if (v.includes("T")) return v.slice(0, 10);
+    return v;
+  }
+
+  return null;
+}
+
+// Apply output normalization to 1 row
+function normalizeApplicationRow(row: any) {
+  if (!row) return row;
+  return {
+    ...row,
+    move_in_date: toDateOnlyOutput(row.move_in_date),
+  };
+}
+
+// Apply to array
+function normalizeApplicationRows(rows: any[]) {
+  return rows.map(normalizeApplicationRow);
+}
+
+export async function applicationRoutes(app: FastifyInstance) {
+  // LIST
+  app.get("/applications", { preHandler: [app.authenticate] }, async (req) => {
+    const q = listApplicationsQuerySchema.parse(req.query ?? {});
+    const userId = req.user.sub;
+    const orgId = req.user.org;
+
+    const data = await withRlsTransaction(
+      { userId, organizationId: orgId },
+      async (client: PoolClient) => {
+        const rows = await listAllApplications(client, {
+          limit: q.limit,
+          offset: q.offset,
+          listing_id: q.listingId,
+          property_id: q.propertyId,
+          applicant_id: q.applicantId,
+          status: q.status ?? undefined,
+        });
+
+        return normalizeApplicationRows(rows as any[]);
+      }
+    );
+
+    return { ok: true, data, paging: { limit: q.limit, offset: q.offset } };
+  });
+
+  // GET ONE
+  app.get("/applications/:id", { preHandler: [app.authenticate] }, async (req) => {
+    const { id } = req.params as any;
+    const userId = req.user.sub;
+    const orgId = req.user.org;
+
+    const data = await withRlsTransaction(
+      { userId, organizationId: orgId },
+      async (client: PoolClient) => {
+        const row = await getApplication(client, String(id));
+        return normalizeApplicationRow(row);
+      }
+    );
+
+    return { ok: true, data };
+  });
+
+  // CREATE
+  app.post("/applications", { preHandler: [app.authenticate] }, async (req) => {
+    const body = createApplicationBodySchema.parse(req.body ?? {});
+    const userId = req.user.sub;
+    const orgId = req.user.org;
+
+    const allowStatus = req.user.role === "admin";
+    const status = allowStatus ? (body.status ?? undefined) : undefined;
+
+    const data = await withRlsTransaction(
+      { userId, organizationId: orgId },
+      async (client: PoolClient) => {
+        const row = await createApplication(
+          client,
+          { userId },
+          {
+            listing_id: body.listingId,
+            property_id: body.propertyId,
+            message: body.message ?? null,
+            monthly_income: body.monthlyIncome ?? null,
+            move_in_date: normalizeDateOnlyInput(body.moveInDate),
+            status,
+          }
+        );
+
+        return normalizeApplicationRow(row);
+      }
+    );
+
+    return { ok: true, data };
+  });
+
+  // PATCH
+  app.patch("/applications/:id", { preHandler: [app.authenticate] }, async (req) => {
+    const { id } = req.params as any;
+    const body = patchApplicationBodySchema.parse(req.body ?? {});
+    const userId = req.user.sub;
+    const orgId = req.user.org;
+
+    const patch: any = {};
+    if (body.status !== undefined) patch.status = body.status;
+    if (body.message !== undefined) patch.message = body.message;
+    if (body.monthlyIncome !== undefined) patch.monthly_income = body.monthlyIncome;
+
+    if (body.moveInDate !== undefined) {
+      patch.move_in_date = normalizeDateOnlyInput(body.moveInDate);
+    }
+
+    const data = await withRlsTransaction(
+      { userId, organizationId: orgId },
+      async (client: PoolClient) => {
+        const row = await updateApplication(client, String(id), patch);
+        return normalizeApplicationRow(row);
+      }
+    );
+
+    return { ok: true, data };
+  });
+}
+----- src/routes/listings.ts -----
+import type { FastifyInstance } from "fastify";
+import type { PoolClient } from "pg";
+import { withRlsTransaction } from "../config/database.js";
+import {
+  createListing,
+  getListing,
+  listAllListings,
+  updateListing,
+} from "../services/listings.service.js";
+import type { CreateListingBody, PatchListingBody } from "../schemas/listings.schema.js";
+
+export async function listingRoutes(app: FastifyInstance) {
+  // LIST
+  app.get("/listings", { preHandler: [app.authenticate] }, async (req) => {
+    const q = req.query as any;
+    const limit = Math.max(1, Math.min(100, Number(q.limit ?? 10)));
+    const offset = Math.max(0, Number(q.offset ?? 0));
+
+    const userId = req.user.sub;
+    const orgId = req.user.org;
+
+    const data = await withRlsTransaction(
+      { userId, organizationId: orgId },
+      async (client: PoolClient) => listAllListings(client, { limit, offset })
+    );
+
+    return { ok: true, data, paging: { limit, offset } };
+  });
+
+  // GET ONE
+  app.get("/listings/:id", { preHandler: [app.authenticate] }, async (req) => {
+    const { id } = req.params as any;
+
+    const userId = req.user.sub;
+    const orgId = req.user.org;
+
+    const data = await withRlsTransaction(
+      { userId, organizationId: orgId },
+      async (client: PoolClient) => getListing(client, id)
+    );
+
+    return { ok: true, data };
+  });
+
+  // CREATE
+  app.post("/listings", { preHandler: [app.authenticate] }, async (req, reply) => {
+    const body = req.body as CreateListingBody;
+
+    // app-level checks to avoid DB trigger errors
+    if (!body.propertyId) return reply.code(400).send({ ok: false, message: "propertyId is required" });
+    if (!body.kind) return reply.code(400).send({ ok: false, message: "kind is required" });
+    if (!body.payeeUserId) return reply.code(400).send({ ok: false, message: "payeeUserId is required" });
+    if (typeof body.basePrice !== "number" || body.basePrice <= 0) {
+      return reply.code(400).send({ ok: false, message: "basePrice must be > 0" });
+    }
+    if (typeof body.listedPrice !== "number" || body.listedPrice <= 0) {
+      return reply.code(400).send({ ok: false, message: "listedPrice must be > 0" });
+    }
+
+    // schema trigger expects agent_id for agent_direct (and usually agent_partner too)
+    if ((body.kind === "agent_direct" || body.kind === "agent_partner") && !body.agentId) {
+      return reply.code(400).send({ ok: false, message: `${body.kind} listing requires agentId` });
+    }
+
+    const userId = req.user.sub;
+    const orgId = req.user.org;
+
+    const data = await withRlsTransaction(
+      { userId, organizationId: orgId },
+      async (client: PoolClient) => {
+        return createListing(client, {
+          property_id: body.propertyId,
+          kind: body.kind,
+
+          // omit status if not provided so DB default 'draft' applies
+          status: typeof body.status === "undefined" ? undefined : body.status,
+
+          agent_id: body.agentId ?? null,
+          payee_user_id: body.payeeUserId,
+
+          base_price: body.basePrice,
+          listed_price: body.listedPrice,
+
+          agent_commission_percent: body.agentCommissionPercent ?? null,
+          requires_owner_approval: body.requiresOwnerApproval ?? null,
+          is_public: body.isPublic ?? null,
+          public_note: body.publicNote ?? null,
+        });
+      }
+    );
+
+    return { ok: true, data };
+  });
+
+  // PATCH
+  app.patch("/listings/:id", { preHandler: [app.authenticate] }, async (req) => {
+    const { id } = req.params as any;
+    const body = req.body as PatchListingBody;
+
+    const userId = req.user.sub;
+    const orgId = req.user.org;
+
+    const data = await withRlsTransaction(
+      { userId, organizationId: orgId },
+      async (client: PoolClient) => {
+        return updateListing(client, id, {
+          status: body.status ?? undefined,
+          agent_id: body.agentId ?? undefined,
+          payee_user_id: body.payeeUserId ?? undefined,
+          base_price: body.basePrice ?? undefined,
+          listed_price: body.listedPrice ?? undefined,
+          agent_commission_percent: body.agentCommissionPercent ?? undefined,
+          requires_owner_approval: body.requiresOwnerApproval ?? undefined,
+          is_public: body.isPublic ?? undefined,
+          public_note: body.publicNote ?? undefined,
+        });
+      }
+    );
+
+    return { ok: true, data };
+  });
+}
+
+----- src/routes/properties.ts -----
+// src/routes/properties.ts
+import type { FastifyInstance } from "fastify";
+
+import {
+  createPropertySchema,
+  listPropertiesQuerySchema,
+  patchPropertySchema,
+} from "../schemas/properties.schema.js";
+
+import {
+  createPropertyForOrg,
+  listPropertiesForOrg,
+  getPropertyForOrg,
+  patchPropertyForOrg,
+} from "../services/properties.service.js";
+
+export async function propertyRoutes(app: FastifyInstance) {
+  // CREATE
+  app.post(
+    "/properties",
+    { preHandler: [app.authenticate] },
+    async (req, reply) => {
+      const parsed = createPropertySchema.safeParse(req.body);
+      if (!parsed.success) {
+        return reply.code(400).send({
+          ok: false,
+          error: "VALIDATION_ERROR",
+          issues: parsed.error.flatten(),
+        });
+      }
+
+      const userId = req.user.sub;
+      const organizationId = req.user.org;
+
+      const row = await createPropertyForOrg({
+        userId,
+        organizationId,
+        input: parsed.data,
+      });
+
+      return reply.code(201).send({ ok: true, data: row });
+    }
+  );
+
+  // LIST
+  app.get(
+    "/properties",
+    { preHandler: [app.authenticate] },
+    async (req, reply) => {
+      const parsed = listPropertiesQuerySchema.safeParse(req.query);
+      if (!parsed.success) {
+        return reply.code(400).send({
+          ok: false,
+          error: "VALIDATION_ERROR",
+          issues: parsed.error.flatten(),
+        });
+      }
+
+      const userId = req.user.sub;
+      const organizationId = req.user.org;
+
+      const rows = await listPropertiesForOrg({
+        userId,
+        organizationId,
+        query: parsed.data,
+      });
+
+      return {
+        ok: true,
+        data: rows,
+        paging: { limit: parsed.data.limit, offset: parsed.data.offset },
+      };
+    }
+  );
+
+  // GET BY ID
+  app.get(
+    "/properties/:id",
+    { preHandler: [app.authenticate] },
+    async (req, reply) => {
+      const id = (req.params as any).id as string;
+
+      const userId = req.user.sub;
+      const organizationId = req.user.org;
+
+      const row = await getPropertyForOrg({
+        userId,
+        organizationId,
+        propertyId: id,
+      });
+
+      if (!row) {
+        return reply.code(404).send({ ok: false, error: "NOT_FOUND", message: "Property not found" });
+      }
+
+      return { ok: true, data: row };
+    }
+  );
+
+  // PATCH
+  app.patch(
+    "/properties/:id",
+    { preHandler: [app.authenticate] },
+    async (req, reply) => {
+      const id = (req.params as any).id as string;
+
+      const parsed = patchPropertySchema.safeParse(req.body);
+      if (!parsed.success) {
+        return reply.code(400).send({
+          ok: false,
+          error: "VALIDATION_ERROR",
+          issues: parsed.error.flatten(),
+        });
+      }
+
+      const userId = req.user.sub;
+      const organizationId = req.user.org;
+
+      const row = await patchPropertyForOrg({
+        userId,
+        organizationId,
+        propertyId: id,
+        patch: parsed.data,
+      });
+
+      if (!row) {
+        return reply.code(404).send({ ok: false, error: "NOT_FOUND", message: "Property not found" });
+      }
+
+      return { ok: true, data: row };
+    }
+  );
+}
+
+----- src/routes/viewings.ts -----
+import type { FastifyInstance } from "fastify";
+import type { PoolClient } from "pg";
+import { withRlsTransaction } from "../config/database.js";
+
+import { createViewing, getViewing, listAllViewings, updateViewing } from "../services/viewings.service.js";
+import { createViewingBodySchema, listViewingsQuerySchema, patchViewingBodySchema } from "../schemas/viewings.schema.js";
+
+export async function viewingRoutes(app: FastifyInstance) {
+  app.get("/viewings", { preHandler: [app.authenticate] }, async (req) => {
+    const q = listViewingsQuerySchema.parse(req.query ?? {});
+    const userId = req.user.sub;
+    const orgId = req.user.org;
+
+    const data = await withRlsTransaction({ userId, organizationId: orgId }, async (client: PoolClient) => {
+      return listAllViewings(client, {
+        limit: q.limit,
+        offset: q.offset,
+        listing_id: q.listingId,
+        property_id: q.propertyId,
+        tenant_id: q.tenantId,
+        status: q.status ?? undefined,
+      });
+    });
+
+    return { ok: true, data, paging: { limit: q.limit, offset: q.offset } };
+  });
+
+  app.get("/viewings/:id", { preHandler: [app.authenticate] }, async (req) => {
+    const { id } = req.params as any;
+    const userId = req.user.sub;
+    const orgId = req.user.org;
+
+    const data = await withRlsTransaction({ userId, organizationId: orgId }, async (client: PoolClient) => {
+      return getViewing(client, String(id));
+    });
+
+    return { ok: true, data };
+  });
+
+  app.post("/viewings", { preHandler: [app.authenticate] }, async (req) => {
+    const body = createViewingBodySchema.parse(req.body ?? {});
+    const userId = req.user.sub;
+    const orgId = req.user.org;
+
+    const allowStatus = req.user.role === "admin";
+    const status = allowStatus ? (body.status ?? undefined) : undefined;
+
+    const data = await withRlsTransaction({ userId, organizationId: orgId }, async (client: PoolClient) => {
+      return createViewing(client, { userId }, {
+        listing_id: body.listingId,
+        property_id: body.propertyId,
+        scheduled_at: body.scheduledAt,
+        view_mode: body.viewMode ?? undefined,
+        notes: body.notes ?? null,
+        status,
+      });
+    });
+
+    return { ok: true, data };
+  });
+
+  app.patch("/viewings/:id", { preHandler: [app.authenticate] }, async (req) => {
+    const { id } = req.params as any;
+    const body = patchViewingBodySchema.parse(req.body ?? {});
+    const userId = req.user.sub;
+    const orgId = req.user.org;
+
+    const patch: any = {};
+    if (body.scheduledAt !== undefined) patch.scheduled_at = body.scheduledAt;
+    if (body.viewMode !== undefined) patch.view_mode = body.viewMode;
+    if (body.notes !== undefined) patch.notes = body.notes;
+
+    if (body.status !== undefined) {
+      if (req.user.role !== "admin") return { ok: false, error: "FORBIDDEN", message: "Only admin can change viewing status." };
+      patch.status = body.status;
+    }
+
+    const data = await withRlsTransaction({ userId, organizationId: orgId }, async (client: PoolClient) => {
+      return updateViewing(client, String(id), patch);
+    });
+
+    return { ok: true, data };
+  });
+}
+
+----- src/routes/organizations.ts -----
+import type { FastifyInstance } from "fastify";
+import { z } from "zod";
+import { withRlsTransaction } from "../config/database.js";
+import type { PoolClient } from "pg";
+
+const paramsSchema = z.object({
+  id: z.string().uuid(),
+});
+
+const updateBodySchema = z.object({
+  name: z.string().min(2).max(120),
+});
+
+type OrgRow = {
+  id: string;
+  name: string;
+  created_at?: string;
+  updated_at?: string;
+};
+
+async function getOrg(client: PoolClient, id: string): Promise<OrgRow | null> {
+  const { rows } = await client.query<OrgRow>(
+    `
+    SELECT id, name, created_at, updated_at
+    FROM organizations
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [id]
+  );
+  return rows[0] ?? null;
+}
+
+async function updateOrgName(client: PoolClient, id: string, name: string): Promise<OrgRow | null> {
+  const { rows } = await client.query<OrgRow>(
+    `
+    UPDATE organizations
+    SET name = $2, updated_at = now()
+    WHERE id = $1
+    RETURNING id, name, created_at, updated_at
+    `,
+    [id, name]
+  );
+  return rows[0] ?? null;
+}
+
+export async function organizationRoutes(app: FastifyInstance) {
+  // GET /v1/organizations/:id
+  app.get(
+    "/organizations/:id",
+    { preHandler: [app.authenticate] },
+    async (req) => {
+      const { id } = paramsSchema.parse((req as any).params);
+
+      const userId = req.user.sub;
+      const organizationId = req.user.org;
+
+      const org = await withRlsTransaction(
+        { userId, organizationId },
+        async (client) => getOrg(client, id)
+      );
+
+      if (!org) return { ok: false, error: "NOT_FOUND", message: "Organization not found" };
+      return { ok: true, data: org };
+    }
+  );
+
+  // PUT /v1/organizations/:id
+  app.put(
+    "/organizations/:id",
+    { preHandler: [app.authenticate] },
+    async (req) => {
+      const { id } = paramsSchema.parse((req as any).params);
+      const body = updateBodySchema.parse((req as any).body);
+
+      const userId = req.user.sub;
+      const organizationId = req.user.org;
+
+      const updated = await withRlsTransaction(
+        { userId, organizationId },
+        async (client) => updateOrgName(client, id, body.name)
+      );
+
+      if (!updated) return { ok: false, error: "NOT_FOUND", message: "Organization not found" };
+      return { ok: true, data: updated };
+    }
+  );
+}
+
+----- src/routes/me.ts -----
+import type { FastifyInstance } from "fastify";
+import type { PoolClient } from "pg";
+import { withRlsTransaction } from "../config/database.js";
+
+export async function meRoutes(app: FastifyInstance) {
+  app.get("/me", { preHandler: [app.authenticate] }, async (req) => {
+    const userId = req.user.sub;
+    const organizationId = req.user.org;
+
+    const me = await withRlsTransaction(
+      { userId, organizationId },
+      async (client: PoolClient) => {
+        const { rows } = await client.query(
+          `
+          SELECT
+            id,
+            organization_id,
+            full_name,
+            email,
+            phone,
+            role,
+            verified_status,
+            created_at,
+            updated_at
+          FROM users
+          WHERE id = $1
+          LIMIT 1
+          `,
+          [userId]
+        );
+
+        return rows[0] ?? null;
+      }
+    );
+
+    return { ok: true, data: me };
+  });
+}
+
+==================== 7) Services/Repos: rent invoices, payments, ledger, paystack/webhooks ====================
+
+---- matches for: rent_invoice ----
+src/services/ledger.service.ts:33:    referenceType: "rent_invoice" | "payment" | "purchase" | "subscription";
+src/services/ledger.service.ts:90:    referenceType: "rent_invoice" | "payment" | "purchase" | "subscription";
+src/services/rent_invoices.service.ts:2:import type { InvoiceStatus } from "../schemas/rent_invoices.schema.js";
+src/services/rent_invoices.service.ts:10:} from "../repos/rent_invoices.repo.js";
+src/services/rent_invoices.service.ts:77:    FROM public.rent_invoices ri
+src/services/rent_invoices.service.ts:195: *    public.rent_invoice_payments
+src/services/rent_invoices.service.ts:213:    FROM public.rent_invoices
+src/services/rent_invoices.service.ts:291:  // 3) Link rent_invoice_payments (idempotent)
+src/services/rent_invoices.service.ts:294:    INSERT INTO public.rent_invoice_payments (
+src/services/rent_invoices.service.ts:324:    referenceType: "rent_invoice",
+src/services/rent_invoices.service.ts:334:    referenceType: "rent_invoice",
+src/services/rent_invoices.service.ts:347:    UPDATE public.rent_invoices
+src/repos/rent_invoices.repo.ts:2:import type { InvoiceStatus } from "../schemas/rent_invoices.schema.js";
+src/repos/rent_invoices.repo.ts:28:    FROM public.rent_invoices
+src/repos/rent_invoices.repo.ts:50:    FROM public.rent_invoices
+src/repos/rent_invoices.repo.ts:83:    INSERT INTO public.rent_invoices (
+src/routes/rent_invoices.ts:1:// src/routes/rent_invoices.ts
+src/routes/rent_invoices.ts:10:} from "../services/rent_invoices.service.js";
+src/routes/rent_invoices.ts:16:} from "../schemas/rent_invoices.schema.js";
+src/routes/index.ts:16:import { rentInvoicesRoutes } from "./rent_invoices.js";
+
+---- matches for: rent_invoices ----
+src/services/rent_invoices.service.ts:2:import type { InvoiceStatus } from "../schemas/rent_invoices.schema.js";
+src/services/rent_invoices.service.ts:10:} from "../repos/rent_invoices.repo.js";
+src/services/rent_invoices.service.ts:77:    FROM public.rent_invoices ri
+src/services/rent_invoices.service.ts:213:    FROM public.rent_invoices
+src/services/rent_invoices.service.ts:347:    UPDATE public.rent_invoices
+src/repos/rent_invoices.repo.ts:2:import type { InvoiceStatus } from "../schemas/rent_invoices.schema.js";
+src/repos/rent_invoices.repo.ts:28:    FROM public.rent_invoices
+src/repos/rent_invoices.repo.ts:50:    FROM public.rent_invoices
+src/repos/rent_invoices.repo.ts:83:    INSERT INTO public.rent_invoices (
+src/routes/rent_invoices.ts:1:// src/routes/rent_invoices.ts
+src/routes/rent_invoices.ts:10:} from "../services/rent_invoices.service.js";
+src/routes/rent_invoices.ts:16:} from "../schemas/rent_invoices.schema.js";
+src/routes/index.ts:16:import { rentInvoicesRoutes } from "./rent_invoices.js";
+
+---- matches for: invoice_payments ----
+src/services/rent_invoices.service.ts:195: *    public.rent_invoice_payments
+src/services/rent_invoices.service.ts:291:  // 3) Link rent_invoice_payments (idempotent)
+src/services/rent_invoices.service.ts:294:    INSERT INTO public.rent_invoice_payments (
+
+---- matches for: payments ----
+src/services/rent_invoices.service.ts:194: *    public.rent_payments
+src/services/rent_invoices.service.ts:195: *    public.rent_invoice_payments
+src/services/rent_invoices.service.ts:247:  // 2) Create rent_payments
+src/services/rent_invoices.service.ts:250:    INSERT INTO public.rent_payments (
+src/services/rent_invoices.service.ts:291:  // 3) Link rent_invoice_payments (idempotent)
+src/services/rent_invoices.service.ts:294:    INSERT INTO public.rent_invoice_payments (
+src/services/purchase_payments.service.ts:127:        FROM public.property_purchase_payments ppp
+src/services/purchase_payments.service.ts:219:          FROM public.property_purchase_payments ppp
+src/routes/purchases.routes.ts:4:import { payPropertyPurchase } from "../services/purchase_payments.service.js";
+src/routes/purchases.routes.ts:141:            select 1 from public.property_purchase_payments ppp
+src/routes/purchases.routes.ts:206:              from public.property_purchase_payments link
+src/routes/purchases.routes.ts:207:              join public.payments p on p.id = link.payment_id
+src/routes/purchases.routes.ts:209:            ), '[]'::jsonb) as payments,
+
+---- matches for: payment_splits ----
+
+---- matches for: wallet_credit_from_splits ----
+
+---- matches for: creditPlatformFee ----
+src/services/ledger.service.ts:29:export async function creditPlatformFee(
+src/services/ledger.service.ts:144: * These mirror creditPayee / creditPlatformFee but write debit_* txn types.
+src/services/rent_invoices.service.ts:4:import { creditPlatformFee, creditPayee } from "./ledger.service.js";
+src/services/rent_invoices.service.ts:332:  await creditPlatformFee(client, {
+src/services/purchase_payments.service.ts:3:import { creditPayee, creditPlatformFee } from "./ledger.service.js";
+src/services/purchase_payments.service.ts:183:  await creditPlatformFee(client, {
+
+---- matches for: creditPayee ----
+src/services/ledger.service.ts:85:export async function creditPayee(
+src/services/ledger.service.ts:144: * These mirror creditPayee / creditPlatformFee but write debit_* txn types.
+src/services/rent_invoices.service.ts:4:import { creditPlatformFee, creditPayee } from "./ledger.service.js";
+src/services/rent_invoices.service.ts:321:  await creditPayee(client, {
+src/services/purchase_payments.service.ts:3:import { creditPayee, creditPlatformFee } from "./ledger.service.js";
+src/services/purchase_payments.service.ts:193:  await creditPayee(client, {
+
+---- matches for: paystack ----
+src/config/constants/payment.constants.ts:4:export const PAYMENT_PROVIDERS = ["stripe", "paystack", "flutterwave", "manual"] as const;
+
+---- matches for: webhook ----
+
+---- matches for: transaction_reference ----
+src/routes/purchases.routes.ts:203:                'transaction_reference', p.transaction_reference,
+
+---- matches for: reference_type ----
+src/services/ledger.service.ts:51:      reference_type,
+src/services/ledger.service.ts:112:      reference_type,
+src/services/ledger.service.ts:185:      reference_type,
+src/services/purchase_refunds.service.ts:136:      AND wt.reference_type = 'purchase'
+src/services/purchase_refunds.service.ts:227:        AND wt.reference_type = 'purchase'
+src/services/purchase_refunds.service.ts:245:      reference_type,
+src/services/purchase_escrow.service.ts:156:        id, organization_id, wallet_account_id, txn_type, reference_type, reference_id,
+src/services/purchase_escrow.service.ts:170:        id, organization_id, wallet_account_id, txn_type, reference_type, reference_id,
+src/services/purchase_escrow.service.ts:258:        id, organization_id, wallet_account_id, txn_type, reference_type, reference_id,
+src/services/purchase_escrow.service.ts:273:        id, organization_id, wallet_account_id, txn_type, reference_type, reference_id,
+src/services/purchase_escrow.service.ts:291:          id, organization_id, wallet_account_id, txn_type, reference_type, reference_id,
+src/services/purchase_payments.service.ts:92:  // Check if BOTH ledger txns already exist for this purchase (reference_type='purchase')
+src/services/purchase_payments.service.ts:98:      AND wt.reference_type = 'purchase'
+src/routes/purchases.routes.ts:148:            where wt.reference_type='purchase'
+src/routes/purchases.routes.ts:220:              where wt.reference_type='purchase'
+
+---- matches for: reference_id ----
+src/services/ledger.service.ts:52:      reference_id,
+src/services/ledger.service.ts:113:      reference_id,
+src/services/ledger.service.ts:186:      reference_id,
+src/services/purchase_refunds.service.ts:137:      AND wt.reference_id = $2::uuid
+src/services/purchase_refunds.service.ts:228:        AND wt.reference_id = $3::uuid
+src/services/purchase_refunds.service.ts:246:      reference_id,
+src/services/purchase_escrow.service.ts:156:        id, organization_id, wallet_account_id, txn_type, reference_type, reference_id,
+src/services/purchase_escrow.service.ts:170:        id, organization_id, wallet_account_id, txn_type, reference_type, reference_id,
+src/services/purchase_escrow.service.ts:258:        id, organization_id, wallet_account_id, txn_type, reference_type, reference_id,
+src/services/purchase_escrow.service.ts:273:        id, organization_id, wallet_account_id, txn_type, reference_type, reference_id,
+src/services/purchase_escrow.service.ts:291:          id, organization_id, wallet_account_id, txn_type, reference_type, reference_id,
+src/services/purchase_payments.service.ts:99:      AND wt.reference_id = $2::uuid
+src/routes/purchases.routes.ts:149:              and wt.reference_id=pp.id
+src/routes/purchases.routes.ts:221:                and wt.reference_id=pp.id
+
+==================== 8) Full key service/repo files if present ====================
+
+----- src/services/rent_invoices.service.ts -----
+import type { PoolClient } from "pg";
+import type { InvoiceStatus } from "../schemas/rent_invoices.schema.js";
+import { computePlatformFeeSplit } from "../config/fees.config.js";
+import { creditPlatformFee, creditPayee } from "./ledger.service.js";
+
+import {
+  findRentInvoiceByTenancyPeriod,
+  insertRentInvoice,
+  listRentInvoices,
+} from "../repos/rent_invoices.repo.js";
+
+type TenancyMini = {
+  id: string;
+  tenant_id: string;
+  property_id: string;
+  rent_amount: string;
+};
+
+type RentInvoiceRow = {
+  id: string;
+  organization_id: string;
+  tenancy_id: string;
+  tenant_id: string;
+  property_id: string;
+  invoice_number: string | number | null;
+  status: InvoiceStatus;
+  period_start: string;
+  period_end: string;
+  due_date: string;
+  subtotal: string;
+  late_fee_amount: string | null;
+  total_amount: string;
+  currency: string | null;
+  paid_amount: string | null;
+  paid_at: string | null;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+};
+
+const RENT_INVOICE_SELECT = `
+  id,
+  organization_id,
+  tenancy_id,
+  tenant_id,
+  property_id,
+  invoice_number,
+  status,
+  period_start::text AS period_start,
+  period_end::text AS period_end,
+  due_date::text AS due_date,
+  subtotal::text AS subtotal,
+  late_fee_amount::text AS late_fee_amount,
+  total_amount::text AS total_amount,
+  currency,
+  paid_amount::text AS paid_amount,
+  paid_at::text AS paid_at,
+  notes,
+  created_at::text AS created_at,
+  updated_at::text AS updated_at,
+  deleted_at::text AS deleted_at
+`;
+
+/**
+ * PAYEE RESOLUTION
+ * Uses: properties.owner_id as payee user id
+ */
+async function resolveRentInvoicePayeeUserId(
+  client: PoolClient,
+  invoiceId: string,
+  organizationId: string
+): Promise<string> {
+  const r = await client.query<{ payee_user_id: string }>(
+    `
+    SELECT p.owner_id AS payee_user_id
+    FROM public.rent_invoices ri
+    JOIN public.properties p ON p.id = ri.property_id
+    WHERE ri.id = $1::uuid
+      AND ri.organization_id = $2::uuid
+      AND ri.deleted_at IS NULL
+    LIMIT 1;
+    `,
+    [invoiceId, organizationId]
+  );
+
+  const payee = r.rows[0]?.payee_user_id;
+  if (!payee) throw new Error("Cannot resolve payee_user_id for invoice " + invoiceId);
+  return payee;
+}
+
+function round2(n: number): number {
+  // numeric(15,2) friendly rounding
+  return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
+export async function getRentInvoices(
+  client: PoolClient,
+  args: {
+    limit: number;
+    offset: number;
+    tenancyId?: string;
+    tenantId?: string;
+    propertyId?: string;
+    status?: InvoiceStatus;
+  }
+) {
+  return listRentInvoices(client, {
+    limit: args.limit,
+    offset: args.offset,
+    tenancy_id: args.tenancyId,
+    tenant_id: args.tenantId,
+    property_id: args.propertyId,
+    status: args.status,
+  });
+}
+
+export async function generateRentInvoiceForTenancy(
+  client: PoolClient,
+  args: {
+    organizationId: string;
+    tenancyId: string;
+    periodStart: string;
+    periodEnd: string;
+    dueDate: string;
+
+    subtotal?: number;
+    lateFeeAmount?: number | null;
+    currency?: string | null;
+    status?: InvoiceStatus | null;
+    notes?: string | null;
+  }
+): Promise<{ row: any; reused: boolean }> {
+  const existing = await findRentInvoiceByTenancyPeriod(client, {
+    tenancy_id: args.tenancyId,
+    period_start: args.periodStart,
+    period_end: args.periodEnd,
+    due_date: args.dueDate,
+  });
+  if (existing) return { row: existing, reused: true };
+
+  const { rows } = await client.query<TenancyMini>(
+    `
+    SELECT
+      id,
+      tenant_id,
+      property_id,
+      rent_amount::text AS rent_amount
+    FROM public.tenancies
+    WHERE id = $1::uuid
+      AND deleted_at IS NULL
+    LIMIT 1;
+    `,
+    [args.tenancyId]
+  );
+
+  const tenancy = rows[0];
+  if (!tenancy) {
+    const e: any = new Error("Tenancy not found");
+    e.code = "TENANCY_NOT_FOUND";
+    throw e;
+  }
+
+  const subtotal = typeof args.subtotal === "number" ? args.subtotal : Number(tenancy.rent_amount);
+  const lateFee = args.lateFeeAmount == null ? 0 : Number(args.lateFeeAmount);
+  const total = subtotal + lateFee;
+
+  const currency = (args.currency ?? "USD") || "USD";
+  const status: InvoiceStatus = (args.status ?? "issued") || "issued";
+
+  const row = await insertRentInvoice(client, {
+    organization_id: args.organizationId,
+    tenancy_id: args.tenancyId,
+    tenant_id: tenancy.tenant_id,
+    property_id: tenancy.property_id,
+    period_start: args.periodStart,
+    period_end: args.periodEnd,
+    due_date: args.dueDate,
+    subtotal,
+    late_fee_amount: lateFee,
+    total_amount: total,
+    currency,
+    status,
+    notes: args.notes ?? null,
+  });
+
+  return { row, reused: false };
+}
+
+/**
+ * PAY
+ * - Idempotent: if invoice already paid => return alreadyPaid=true, no duplicate rows
+ * - Creates:
+ *    public.rent_payments
+ *    public.rent_invoice_payments
+ *    public.wallet_transactions:
+ *        - credit_payee (NET) to payee wallet
+ *        - credit_platform_fee (FEE) to platform wallet
+ * - Then marks invoice paid.
+ */
+export async function payRentInvoice(
+  client: PoolClient,
+  args: {
+    invoiceId: string;
+    paymentMethod: string;
+    amount?: number | null;
+  }
+): Promise<{ row: RentInvoiceRow; alreadyPaid: boolean }> {
+  // 1) Load invoice
+  const invRes = await client.query<RentInvoiceRow>(
+    `
+    SELECT ${RENT_INVOICE_SELECT}
+    FROM public.rent_invoices
+    WHERE id = $1::uuid
+      AND deleted_at IS NULL
+    LIMIT 1;
+    `,
+    [args.invoiceId]
+  );
+
+  const invoice = invRes.rows[0];
+  if (!invoice) {
+    const e: any = new Error("Invoice not found");
+    e.code = "INVOICE_NOT_FOUND";
+    throw e;
+  }
+
+  // Idempotent short-circuit
+  if (invoice.status === "paid") {
+    return { row: invoice, alreadyPaid: true };
+  }
+
+  const total = Number(invoice.total_amount);
+  const amount = typeof args.amount === "number" ? args.amount : total;
+
+  if (Number(amount) !== Number(total)) {
+    const e: any = new Error(
+      `Payment.amount (${amount}) must equal invoice.total_amount (${invoice.total_amount})`
+    );
+    e.code = "AMOUNT_MISMATCH";
+    throw e;
+  }
+
+  const currency = (invoice.currency ?? "USD") || "USD";
+  const method = args.paymentMethod || "card";
+
+  // 2) Create rent_payments
+  const rpRes = await client.query<{ id: string }>(
+    `
+    INSERT INTO public.rent_payments (
+      organization_id,
+      tenancy_id,
+      invoice_id,
+      tenant_id,
+      property_id,
+      amount,
+      currency,
+      payment_method
+    )
+    VALUES (
+      $1::uuid,
+      $2::uuid,
+      $3::uuid,
+      $4::uuid,
+      $5::uuid,
+      $6::numeric,
+      $7::text,
+      $8::text
+    )
+    RETURNING id;
+    `,
+    [
+      invoice.organization_id,
+      invoice.tenancy_id,
+      invoice.id,
+      invoice.tenant_id,
+      invoice.property_id,
+      amount,
+      currency,
+      method,
+    ]
+  );
+
+  const rentPaymentId = rpRes.rows[0]?.id;
+  if (!rentPaymentId) {
+    const e: any = new Error("Failed to create rent_payment");
+    e.code = "RENT_PAYMENT_CREATE_FAILED";
+    throw e;
+  }
+
+  // 3) Link rent_invoice_payments (idempotent)
+  await client.query(
+    `
+    INSERT INTO public.rent_invoice_payments (
+      organization_id,
+      invoice_id,
+      rent_payment_id,
+      amount
+    )
+    VALUES ($1::uuid, $2::uuid, $3::uuid, $4::numeric)
+    ON CONFLICT DO NOTHING;
+    `,
+    [invoice.organization_id, invoice.id, rentPaymentId, amount]
+  );
+  // 4) Split platform fee + payee net, then credit wallets (centralized logic)
+
+  // 4) Split platform fee (2.5%) + credit wallets (SINGLE SOURCE OF TRUTH)
+  const split = computePlatformFeeSplit({
+    paymentKind: "rent",
+    amount,
+    currency,
+  });
+
+  // Resolve payee (landlord/owner) and credit net
+  const payeeUserId = await resolveRentInvoicePayeeUserId(
+    client,
+    invoice.id,
+    invoice.organization_id
+  );
+
+  await creditPayee(client, {
+    organizationId: invoice.organization_id,
+    payeeUserId,
+    referenceType: "rent_invoice",
+    referenceId: invoice.id,
+    amount: split.payeeNet,
+    currency,
+    note: `Rent net (after ${split.pctUsed}% fee) for invoice ${invoice.invoice_number ?? invoice.id}`,
+  });
+
+  // Credit platform fee into platform wallet
+  await creditPlatformFee(client, {
+    organizationId: invoice.organization_id,
+    referenceType: "rent_invoice",
+    referenceId: invoice.id,
+    amount: split.platformFee,
+    currency,
+    note: `Platform fee (${split.pctUsed}%) for invoice ${invoice.invoice_number ?? invoice.id}`,
+  });
+
+
+
+
+  // 5) Mark invoice paid (paid_amount is FULL amount paid)
+  const updRes = await client.query<RentInvoiceRow>(
+    `
+    UPDATE public.rent_invoices
+    SET
+      status = 'paid'::invoice_status,
+      paid_amount = $2::numeric,
+      paid_at = NOW()
+    WHERE id = $1::uuid
+      AND deleted_at IS NULL
+    RETURNING ${RENT_INVOICE_SELECT};
+    `,
+    [invoice.id, amount]
+  );
+
+  return { row: updRes.rows[0]!, alreadyPaid: false };
+}
+----- src/repos/rent_invoices.repo.ts -----
+import type { PoolClient } from "pg";
+import type { InvoiceStatus } from "../schemas/rent_invoices.schema.js";
+
+export async function listRentInvoices(
+  client: PoolClient,
+  args: {
+    limit: number;
+    offset: number;
+    tenancy_id?: string;
+    tenant_id?: string;
+    property_id?: string;
+    status?: InvoiceStatus;
+  }
+) {
+  const where: string[] = ["deleted_at IS NULL"];
+  const params: any[] = [];
+  let i = 1;
+
+  if (args.tenancy_id) { where.push(`tenancy_id = $${i++}::uuid`); params.push(args.tenancy_id); }
+  if (args.tenant_id)  { where.push(`tenant_id  = $${i++}::uuid`); params.push(args.tenant_id); }
+  if (args.property_id){ where.push(`property_id= $${i++}::uuid`); params.push(args.property_id); }
+  if (args.status)     { where.push(`status = $${i++}::invoice_status`); params.push(args.status); }
+
+  params.push(args.limit, args.offset);
+
+  const sql = `
+    SELECT *
+    FROM public.rent_invoices
+    WHERE ${where.join(" AND ")}
+    ORDER BY created_at DESC
+    LIMIT $${i++} OFFSET $${i++};
+  `;
+
+  const { rows } = await client.query(sql, params);
+  return rows;
+}
+
+export async function findRentInvoiceByTenancyPeriod(
+  client: PoolClient,
+  args: {
+    tenancy_id: string;
+    period_start: string;
+    period_end: string;
+    due_date: string;
+  }
+) {
+  const { rows } = await client.query(
+    `
+    SELECT *
+    FROM public.rent_invoices
+    WHERE tenancy_id = $1::uuid
+      AND period_start = $2::date
+      AND period_end   = $3::date
+      AND due_date     = $4::date
+      AND deleted_at IS NULL
+    LIMIT 1;
+    `,
+    [args.tenancy_id, args.period_start, args.period_end, args.due_date]
+  );
+  return rows[0] ?? null;
+}
+
+export async function insertRentInvoice(
+  client: PoolClient,
+  args: {
+    organization_id: string;          // ✅ REQUIRED NOW
+    tenancy_id: string;
+    tenant_id: string;
+    property_id: string;
+    period_start: string;
+    period_end: string;
+    due_date: string;
+    subtotal: number;
+    late_fee_amount: number;
+    total_amount: number;
+    currency: string;
+    status: InvoiceStatus;
+    notes?: string | null;
+  }
+) {
+  const { rows } = await client.query(
+    `
+    INSERT INTO public.rent_invoices (
+      organization_id,
+      tenancy_id,
+      tenant_id,
+      property_id,
+      period_start,
+      period_end,
+      due_date,
+      subtotal,
+      late_fee_amount,
+      total_amount,
+      currency,
+      status,
+      notes
+    ) VALUES (
+      $1::uuid,
+      $2::uuid,
+      $3::uuid,
+      $4::uuid,
+      $5::date,
+      $6::date,
+      $7::date,
+      $8::numeric,
+      $9::numeric,
+      $10::numeric,
+      $11::text,
+      $12::invoice_status,
+      $13::text
+    )
+    RETURNING *;
+    `,
+    [
+      args.organization_id,
+      args.tenancy_id,
+      args.tenant_id,
+      args.property_id,
+      args.period_start,
+      args.period_end,
+      args.due_date,
+      args.subtotal,
+      args.late_fee_amount,
+      args.total_amount,
+      args.currency,
+      args.status,
+      args.notes ?? null,
+    ]
+  );
+
+  return rows[0]!;
+}
+
+----- src/services/ledger.service.ts -----
+import type { PoolClient } from "pg";
+import { ensureWalletAccount } from "../utils/wallets.js";
+
+/**
+ * Find oldest platform wallet for org (you currently have 2; we pick earliest).
+ */
+export async function getPlatformWalletId(
+  client: PoolClient,
+  organizationId: string
+): Promise<string | null> {
+  const { rows } = await client.query<{ id: string }>(
+    `
+    SELECT id
+    FROM public.wallet_accounts
+    WHERE organization_id = $1::uuid
+      AND is_platform_wallet = true
+    ORDER BY created_at ASC
+    LIMIT 1;
+    `,
+    [organizationId]
+  );
+  return rows[0]?.id ?? null;
+}
+
+/**
+ * Credit platform fee into platform wallet.
+ * Uses txn_type = credit_platform_fee.
+ */
+export async function creditPlatformFee(
+  client: PoolClient,
+  args: {
+    organizationId: string;
+    referenceType: "rent_invoice" | "payment" | "purchase" | "subscription";
+    referenceId: string;
+    amount: number;
+    currency: string;
+    note: string;
+  }
+) {
+  if (!args.amount || args.amount <= 0) return;
+
+  const platformWalletId = await getPlatformWalletId(client, args.organizationId);
+  if (!platformWalletId) return;
+
+  await client.query(
+    `
+    INSERT INTO public.wallet_transactions (
+      organization_id,
+      wallet_account_id,
+      txn_type,
+      reference_type,
+      reference_id,
+      amount,
+      currency,
+      note
+    )
+    VALUES (
+      $1::uuid,
+      $2::uuid,
+      'credit_platform_fee'::wallet_transaction_type,
+      $3::text,
+      $4::uuid,
+      $5::numeric,
+      $6::text,
+      $7::text
+    )
+    ON CONFLICT DO NOTHING;
+    `,
+    [
+      args.organizationId,
+      platformWalletId,
+      args.referenceType,
+      args.referenceId,
+      args.amount,
+      args.currency,
+      args.note,
+    ]
+  );
+}
+
+/**
+ * Credit payee (landlord) wallet.
+ * Uses txn_type = credit_payee.
+ */
+export async function creditPayee(
+  client: PoolClient,
+  args: {
+    organizationId: string;
+    payeeUserId: string;
+    referenceType: "rent_invoice" | "payment" | "purchase" | "subscription";
+    referenceId: string;
+    amount: number;
+    currency: string;
+    note: string;
+  }
+) {
+  if (!args.amount || args.amount <= 0) return;
+
+  const payeeWalletId = await ensureWalletAccount(client, {
+    organizationId: args.organizationId,
+    userId: args.payeeUserId,
+    currency: args.currency,
+    isPlatformWallet: false,
+  });
+
+  await client.query(
+    `
+    INSERT INTO public.wallet_transactions (
+      organization_id,
+      wallet_account_id,
+      txn_type,
+      reference_type,
+      reference_id,
+      amount,
+      currency,
+      note
+    )
+    VALUES (
+      $1::uuid,
+      $2::uuid,
+      'credit_payee'::wallet_transaction_type,
+      $3::text,
+      $4::uuid,
+      $5::numeric,
+      $6::text,
+      $7::text
+    )
+    ON CONFLICT DO NOTHING;
+    `,
+    [
+      args.organizationId,
+      payeeWalletId,
+      args.referenceType,
+      args.referenceId,
+      args.amount,
+      args.currency,
+      args.note,
+    ]
+  );
+}
+
+/**
+ * Refund / reversal helpers
+ * These mirror creditPayee / creditPlatformFee but write debit_* txn types.
+ * Assumes wallet_transaction_type enum includes debit_payee and debit_platform_fee.
+ */
+
+
+
+/* ------------------------------------------------------------------
+ * Refund helpers (shared insert + debit txns)
+ * ------------------------------------------------------------------ */
+
+type WalletTxnInsertArgs = {
+  organizationId: string;
+  walletAccountId: string;
+  txnType:
+    | "credit_platform_fee"
+    | "credit_payee"
+    | "debit_platform_fee"
+    | "debit_payee";
+  amount: number;
+  currency: string;
+  referenceType: string;
+  referenceId: string;
+};
+
+/**
+ * Insert a wallet transaction in a single place.
+ * Idempotency: relies on your existing unique constraints (if any),
+ * but still safe to call because we use ON CONFLICT DO NOTHING.
+ */
+export async function insertWalletTransaction(
+  client: PoolClient,
+  args: WalletTxnInsertArgs
+): Promise<{ id: string | null }> {
+  const { rows } = await client.query<{ id: string }>(
+    `
+    INSERT INTO public.wallet_transactions (
+      organization_id,
+      wallet_account_id,
+      txn_type,
+      amount,
+      currency,
+      reference_type,
+      reference_id,
+      created_at,
+      updated_at
+    )
+    VALUES (
+      $1::uuid,
+      $2::uuid,
+      $3::wallet_transaction_type,
+      $4::numeric,
+      $5::varchar(3),
+      $6::text,
+      $7::uuid,
+      NOW(),
+      NOW()
+    )
+    ON CONFLICT DO NOTHING
+    RETURNING id::text AS id;
+    `,
+    [
+      args.organizationId,
+      args.walletAccountId,
+      args.txnType,
+      args.amount,
+      args.currency,
+      args.referenceType,
+      args.referenceId,
+    ]
+  );
+
+  return { id: rows?.[0]?.id ?? null };
+}
+
+async function getPlatformWalletAccountId(
+  client: PoolClient,
+  organizationId: string
+): Promise<string> {
+  const { rows } = await client.query<{ id: string }>(
+    `
+    SELECT id::text AS id
+    FROM public.wallet_accounts
+    WHERE organization_id = $1::uuid
+      AND is_platform_wallet = true
+    ORDER BY created_at ASC
+    LIMIT 1;
+    `,
+    [organizationId]
+  );
+
+  const id = rows?.[0]?.id;
+  if (!id) {
+    const e: any = new Error("Platform wallet account not found");
+    e.code = "PLATFORM_WALLET_NOT_FOUND";
+    throw e;
+  }
+  return id;
+}
+
+async function getPayeeWalletAccountId(
+  client: PoolClient,
+  args: { organizationId: string; payeeUserId: string }
+): Promise<string> {
+  const { rows } = await client.query<{ id: string }>(
+    `
+    SELECT id::text AS id
+    FROM public.wallet_accounts
+    WHERE organization_id = $1::uuid
+      AND user_id = $2::uuid
+      AND is_platform_wallet = false
+    ORDER BY created_at ASC
+    LIMIT 1;
+    `,
+    [args.organizationId, args.payeeUserId]
+  );
+
+  const id = rows?.[0]?.id;
+  if (!id) {
+    const e: any = new Error("Payee wallet account not found");
+    e.code = "PAYEE_WALLET_NOT_FOUND";
+    throw e;
+  }
+  return id;
+}
+
+export async function debitPlatformFee(
+  client: PoolClient,
+  args: {
+    organizationId: string;
+    referenceType: string;
+    referenceId: string;
+    amount: number;
+    currency: string;
+    note?: string | null; // kept for compatibility; not required for insert
+  }
+): Promise<void> {
+  const walletAccountId = await getPlatformWalletAccountId(
+    client,
+    args.organizationId
+  );
+
+  await insertWalletTransaction(client, {
+    organizationId: args.organizationId,
+    walletAccountId,
+    txnType: "debit_platform_fee",
+    amount: Number(args.amount),
+    currency: args.currency,
+    referenceType: args.referenceType,
+    referenceId: args.referenceId,
+  });
+}
+
+export async function debitPayee(
+  client: PoolClient,
+  args: {
+    organizationId: string;
+    payeeUserId: string;
+    referenceType: string;
+    referenceId: string;
+    amount: number;
+    currency: string;
+    note?: string | null; // kept for compatibility; not required for insert
+  }
+): Promise<void> {
+  const walletAccountId = await getPayeeWalletAccountId(client, {
+    organizationId: args.organizationId,
+    payeeUserId: args.payeeUserId,
+  });
+
+  await insertWalletTransaction(client, {
+    organizationId: args.organizationId,
+    walletAccountId,
+    txnType: "debit_payee",
+    amount: Number(args.amount),
+    currency: args.currency,
+    referenceType: args.referenceType,
+    referenceId: args.referenceId,
+  });
+}
+
+----- src/services/purchase_payments.service.ts -----
+import type { PoolClient } from "pg";
+import { computePlatformFeeSplit } from "../config/fees.config.js";
+import { creditPayee, creditPlatformFee } from "./ledger.service.js";
+
+export type PurchasePaymentMethod = "card" | "bank_transfer" | "wallet";
+
+export type PropertyPurchaseRow = {
+  id: string;
+  organization_id: string;
+  property_id: string;
+  listing_id: string | null;
+  buyer_id: string;
+  seller_id: string;
+  agreed_price: string;
+  currency: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+};
+
+const PURCHASE_SELECT = `
+  id,
+  organization_id,
+  property_id,
+  listing_id,
+  buyer_id,
+  seller_id,
+  agreed_price::text AS agreed_price,
+  currency,
+  status::text AS status,
+  created_at::text AS created_at,
+  updated_at::text AS updated_at,
+  deleted_at::text AS deleted_at,
+  payment_status::text AS payment_status,
+  paid_at::text AS paid_at,
+  paid_amount::text AS paid_amount,
+  last_payment_id::text AS last_payment_id
+`;
+
+/** Load purchase row (strict org + not deleted) */
+export async function getPropertyPurchase(
+  client: PoolClient,
+  args: { organizationId: string; purchaseId: string }
+): Promise<PropertyPurchaseRow> {
+  const { rows } = await client.query<PropertyPurchaseRow>(
+    `
+    SELECT ${PURCHASE_SELECT}
+    FROM public.property_purchases
+    WHERE id = $1::uuid
+      AND organization_id = $2::uuid
+      AND deleted_at IS NULL
+    LIMIT 1;
+    `,
+    [args.purchaseId, args.organizationId]
+  );
+
+  const row = rows[0];
+  if (!row) {
+    const e: any = new Error("Purchase not found");
+    e.code = "PURCHASE_NOT_FOUND";
+    throw e;
+  }
+  return row;
+}
+
+/**
+ * PAY purchase
+ * Idempotent-ish:
+ *  - If already has BOTH txns (platform fee + payee) for this purchase reference, we return alreadyPaid=true.
+ *  - Also uses ON CONFLICT DO NOTHING in ledger.service insert (assuming you keep that).
+ */
+export async function payPropertyPurchase(
+  client: PoolClient,
+  args: {
+    organizationId: string;
+    purchaseId: string;
+    paymentMethod: PurchasePaymentMethod;
+    amount?: number | null; // defaults to agreed_price
+  }
+): Promise<{
+  purchase: PropertyPurchaseRow;
+  alreadyPaid: boolean;
+  platformFee: number;
+  sellerNet: number;
+}> {
+  const purchase = await getPropertyPurchase(client, {
+    organizationId: args.organizationId,
+    purchaseId: args.purchaseId,
+  });
+
+  // Check if BOTH ledger txns already exist for this purchase (reference_type='purchase')
+  const chk = await client.query<{ txn_type: string; cnt: string }>(
+    `
+    SELECT wt.txn_type::text AS txn_type, count(*)::text AS cnt
+    FROM public.wallet_transactions wt
+    WHERE wt.organization_id = $1::uuid
+      AND wt.reference_type = 'purchase'
+      AND wt.reference_id = $2::uuid
+      AND wt.txn_type IN ('credit_payee'::wallet_transaction_type, 'credit_platform_fee'::wallet_transaction_type)
+    GROUP BY wt.txn_type
+    `,
+    [args.organizationId, purchase.id]
+  );
+
+  const hasPayee = chk.rows.some((r) => r.txn_type === "credit_payee" && Number(r.cnt) > 0);
+  const hasFee = chk.rows.some((r) => r.txn_type === "credit_platform_fee" && Number(r.cnt) > 0);
+
+  if (hasPayee && hasFee) {
+    const agreed = Number(purchase.agreed_price);
+    const split = computePlatformFeeSplit({
+      paymentKind: "buy",
+      amount: agreed,
+      currency: (purchase.currency ?? "USD") || "USD",
+    });
+
+      // ------------------------------------------------------------
+      // Milestones: mark purchase as paid (without changing lifecycle enum)
+      // - payment_status='paid'
+      // - paid_at set once
+      // - paid_amount defaults to agreed_price
+      // - last_payment_id set from latest purchase-payment link (if exists)
+      // ------------------------------------------------------------
+      const lastPay = await client.query<{ payment_id: string | null }>(
+        `
+        SELECT ppp.payment_id::text AS payment_id
+        FROM public.property_purchase_payments ppp
+        WHERE ppp.organization_id = $1::uuid
+          AND ppp.purchase_id = $2::uuid
+        ORDER BY ppp.created_at DESC
+        LIMIT 1;
+        `,
+        [args.organizationId, purchase.id]
+      );
+
+      const lastPaymentId = lastPay.rows?.[0]?.payment_id ?? null;
+
+      await client.query(
+        `
+        UPDATE public.property_purchases
+        SET
+          payment_status = 'paid'::purchase_payment_status,
+          paid_at = COALESCE(paid_at, NOW()),
+          paid_amount = COALESCE(paid_amount, agreed_price),
+          last_payment_id = COALESCE(last_payment_id, $1::uuid),
+          updated_at = NOW()
+        WHERE id = $2::uuid
+          AND organization_id = $3::uuid
+          AND deleted_at IS NULL;
+        `,
+        [lastPaymentId, purchase.id, args.organizationId]
+      );
+    const refreshed = await getPropertyPurchase(client, {
+
+      organizationId: args.organizationId,
+
+      purchaseId: purchase.id,
+
+    });
+
+
+    return { purchase: refreshed, alreadyPaid: true, platformFee: 0, sellerNet: 0 };
+}
+
+  const agreed = Number(purchase.agreed_price);
+  const amount = typeof args.amount === "number" ? args.amount : agreed;
+
+  if (Number(amount) !== Number(agreed)) {
+    const e: any = new Error(`Payment.amount (${amount}) must equal agreed_price (${purchase.agreed_price})`);
+    e.code = "AMOUNT_MISMATCH";
+    throw e;
+  }
+
+  const currency = (purchase.currency ?? "USD") || "USD";
+
+  const split = computePlatformFeeSplit({
+    paymentKind: "buy",
+    amount,
+    currency,
+  });
+
+  // 1) credit platform fee
+  await creditPlatformFee(client, {
+    organizationId: args.organizationId,
+    referenceType: "purchase",
+    referenceId: purchase.id,
+    amount: split.platformFee,
+    currency,
+    note: `2.5% platform fee for purchase ${purchase.id}`,
+  });
+
+  // 2) credit seller net
+  await creditPayee(client, {
+    organizationId: args.organizationId,
+    payeeUserId: purchase.seller_id,
+    referenceType: "purchase",
+    referenceId: purchase.id,
+    amount: split.payeeNet,
+    currency,
+    note: `Purchase payout (net) for purchase ${purchase.id}`,
+  });
+
+  // 3) Update purchase payment milestone fields (does NOT change lifecycle status enum)
+  // payment_status tracks money state; status tracks workflow (under_contract, escrow_opened, closing_scheduled, etc.)
+  await client.query(
+    `
+    UPDATE public.property_purchases pp
+    SET
+      paid_at = COALESCE(pp.paid_at, NOW()),
+      paid_amount = COALESCE(pp.paid_amount, 0) + $1::numeric,
+      payment_status = CASE
+        WHEN (COALESCE(pp.paid_amount, 0) + $1::numeric) >= pp.agreed_price THEN 'paid'::purchase_payment_status
+        WHEN (COALESCE(pp.paid_amount, 0) + $1::numeric) > 0 THEN 'partially_paid'::purchase_payment_status
+        ELSE pp.payment_status
+      END,
+      last_payment_id = COALESCE(
+        (
+          SELECT ppp.payment_id
+          FROM public.property_purchase_payments ppp
+          WHERE ppp.purchase_id = pp.id
+          ORDER BY ppp.created_at DESC
+          LIMIT 1
+        ),
+        pp.last_payment_id
+      ),
+      updated_at = NOW()
+    WHERE pp.id = $2::uuid
+      AND pp.organization_id = $3::uuid
+      AND pp.deleted_at IS NULL;
+    `,
+    [amount, purchase.id, args.organizationId]
+  );
+
+
+  // 3) Update purchase payment milestones (no lifecycle enum change)
+  await client.query(
+    `
+    UPDATE public.property_purchases
+    SET
+      payment_status = 'paid'::purchase_payment_status,
+      paid_at = COALESCE(paid_at, NOW()),
+      paid_amount = $1::numeric,
+      updated_at = NOW()
+    WHERE id = $2::uuid
+      AND organization_id = $3::uuid
+      AND deleted_at IS NULL;
+    `,
+    [amount, purchase.id, args.organizationId]
+  );
+
+
+  const updated = await getPropertyPurchase(client, {
+    organizationId: args.organizationId,
+    purchaseId: purchase.id,
+  });
+
+  return { purchase: updated, alreadyPaid: false, platformFee: split.platformFee, sellerNet: split.payeeNet };
+}
+
+----- src/config/payment.config.ts -----
+
+----- src/config/fees.config.ts -----
+export type PaymentKind = "rent" | "buy" | "subscription";
+
+export type FeeContext = {
+  paymentKind: PaymentKind;
+  amount: number;     // total paid amount
+  currency: string;   // e.g. "USD" or "NGN"
+};
+
+export type FeeSplit = {
+  platformFee: number; // >= 0
+  payeeNet: number;    // >= 0
+  pctUsed: number;
+};
+
+/**
+ * SINGLE SOURCE OF TRUTH
+ * Change these values in one place only.
+ */
+export const FEES = {
+  platformFeePct: 2.5,
+  minPlatformFee: 0,
+  maxPlatformFee: Number.POSITIVE_INFINITY,
+} as const;
+
+export function round2(n: number): number {
+  // Safe for numeric(15,2)
+  return Math.round(n * 100) / 100;
+}
+
+export function computePlatformFeeSplit(ctx: FeeContext): FeeSplit {
+  const pct = FEES.platformFeePct;
+
+  let fee = round2((ctx.amount * pct) / 100);
+  if (fee < FEES.minPlatformFee) fee = FEES.minPlatformFee;
+  if (fee > FEES.maxPlatformFee) fee = FEES.maxPlatformFee;
+
+  const net = round2(ctx.amount - fee);
+
+  return {
+    platformFee: fee,
+    payeeNet: net,
+    pctUsed: pct,
+  };
+}
+
+----- src/db/set_pg_context.ts -----
+// src/db/set_pg_context.ts
+import type { PoolClient } from "pg";
+
+export async function setPgContext(
+  client: PoolClient,
+  opts: { userId?: string | null; organizationId?: string | null }
+) {
+  const userId = opts.userId ? String(opts.userId) : "";
+  const orgId = opts.organizationId ? String(opts.organizationId) : "";
+
+  await client.query("select set_config('app.user_id', $1, true)", [userId]);
+  await client.query("select set_config('app.organization_id', $1, true)", [orgId]);
+}
+==================== 9) Ensure routes do NOT read x-organization-id directly ====================
+✅ No routes read x-organization-id directly
+
+==================== 10) Migrations overview (recent + contents) ====================
+migrations/:
+20260117_add_rent_invoice_validation.sql
+
+Show last 3 migration files (first 260 lines each):
+
+----- migrations/20260117_add_rent_invoice_validation.sql -----
+
+CREATE OR REPLACE FUNCTION public.validate_payment_matches_listing()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $function$
+DECLARE
+  l_listed_price numeric(15,2);
+  l_listing_property_id uuid;
+
+  p_agreed_price numeric(15,2);
+  p_currency varchar(3);
+  p_property_id uuid;
+  p_listing_id uuid;
+  p_buyer_id uuid;
+
+  -- rent invoice vars (NEW)
+  ri_total numeric(15,2);
+  ri_paid numeric(15,2);
+  ri_currency varchar(3);
+  ri_property_id uuid;
+  ri_tenant_id uuid;
+  ri_tenancy_id uuid;
+  ri_listing_id uuid;
+
+  ri_remaining numeric(15,2);
+BEGIN
+  -- =========================
+  -- PURCHASE FLOW VALIDATION (existing)
+  -- =========================
+  IF NEW.reference_type = 'purchase' AND NEW.reference_id IS NOT NULL THEN
+    SELECT agreed_price, currency, property_id, listing_id, buyer_id
+      INTO p_agreed_price, p_currency, p_property_id, p_listing_id, p_buyer_id
+    FROM public.property_purchases
+    WHERE id = NEW.reference_id
+      AND deleted_at IS NULL
+    LIMIT 1;
+
+    IF p_property_id IS NULL THEN
+      RAISE EXCEPTION 'Purchase not found for reference_id=%', NEW.reference_id;
+    END IF;
+
+    IF NEW.amount <> p_agreed_price THEN
+      RAISE EXCEPTION 'Payment.amount (%) must equal purchase.agreed_price (%)', NEW.amount, p_agreed_price;
+    END IF;
+
+    IF NEW.property_id <> p_property_id THEN
+      RAISE EXCEPTION 'Payment.property_id (%) must equal purchase.property_id (%)', NEW.property_id, p_property_id;
+    END IF;
+
+    IF NEW.tenant_id <> p_buyer_id THEN
+      RAISE EXCEPTION 'Payment.tenant_id (%) must equal purchase.buyer_id (%)', NEW.tenant_id, p_buyer_id;
+    END IF;
+
+    IF p_listing_id IS NOT NULL AND NEW.listing_id <> p_listing_id THEN
+      RAISE EXCEPTION 'Payment.listing_id (%) must equal purchase.listing_id (%)', NEW.listing_id, p_listing_id;
+    END IF;
+
+    IF NEW.currency IS NULL THEN
+      NEW.currency := p_currency;
+    ELSIF NEW.currency <> p_currency THEN
+      RAISE EXCEPTION 'Payment.currency (%) must equal purchase.currency (%)', NEW.currency, p_currency;
+    END IF;
+
+    RETURN NEW;
+  END IF;
+
+  -- =========================
+  -- RENT INVOICE VALIDATION (NEW)
+  -- =========================
+  IF NEW.reference_type = 'rent_invoice' AND NEW.reference_id IS NOT NULL THEN
+    -- join to tenancies to enforce listing_id (payments.listing_id is NOT NULL)
+    SELECT
+      ri.total_amount,
+      ri.paid_amount,
+      ri.currency,
+      ri.property_id,
+      ri.tenant_id,
+      ri.tenancy_id,
+      t.listing_id
+    INTO
+      ri_total,
+      ri_paid,
+      ri_currency,
+      ri_property_id,
+      ri_tenant_id,
+      ri_tenancy_id,
+      ri_listing_id
+    FROM public.rent_invoices ri
+    JOIN public.tenancies t ON t.id = ri.tenancy_id
+    WHERE ri.id = NEW.reference_id
+      AND ri.deleted_at IS NULL
+    LIMIT 1;
+
+    IF ri_property_id IS NULL THEN
+      RAISE EXCEPTION 'Rent invoice not found for reference_id=%', NEW.reference_id;
+    END IF;
+
+    -- remaining balance (allows partial, blocks overpay)
+    ri_remaining := (ri_total - COALESCE(ri_paid, 0));
+
+    IF NEW.amount > ri_remaining THEN
+      RAISE EXCEPTION 'Payment.amount (%) exceeds remaining invoice balance (%)', NEW.amount, ri_remaining;
+    END IF;
+
+    -- property + tenant must match invoice
+    IF NEW.property_id <> ri_property_id THEN
+      RAISE EXCEPTION 'Payment.property_id (%) must equal invoice.property_id (%)', NEW.property_id, ri_property_id;
+    END IF;
+
+    IF NEW.tenant_id <> ri_tenant_id THEN
+      RAISE EXCEPTION 'Payment.tenant_id (%) must equal invoice.tenant_id (%)', NEW.tenant_id, ri_tenant_id;
+    END IF;
+
+    -- enforce listing_id from tenancy (best/strict)
+    IF ri_listing_id IS NULL THEN
+      RAISE EXCEPTION 'Tenancy (%) has NULL listing_id. Cannot create payments row because payments.listing_id is required.', ri_tenancy_id;
+    END IF;
+
+    IF NEW.listing_id <> ri_listing_id THEN
+      RAISE EXCEPTION 'Payment.listing_id (%) must equal tenancy.listing_id (%) for invoice payments', NEW.listing_id, ri_listing_id;
+    END IF;
+
+    -- currency: default to invoice currency if not provided; otherwise must match
+    IF NEW.currency IS NULL THEN
+      NEW.currency := ri_currency;
+    ELSIF NEW.currency <> ri_currency THEN
+      RAISE EXCEPTION 'Payment.currency (%) must equal invoice.currency (%)', NEW.currency, ri_currency;
+    END IF;
+
+    RETURN NEW;
+  END IF;
+
+  -- =========================
+  -- DEFAULT LISTING VALIDATION (existing)
+  -- =========================
+  SELECT listed_price, property_id
+    INTO l_listed_price, l_listing_property_id
+  FROM public.property_listings
+  WHERE id = NEW.listing_id
+    AND deleted_at IS NULL
+  LIMIT 1;
+
+  IF l_listing_property_id IS NULL THEN
+    RAISE EXCEPTION 'Listing not found for listing_id=%', NEW.listing_id;
+  END IF;
+
+  IF NEW.amount <> l_listed_price THEN
+    RAISE EXCEPTION 'Payment.amount (%) must equal listing.listed_price (%)', NEW.amount, l_listed_price;
+  END IF;
+
+  IF NEW.property_id <> l_listing_property_id THEN
+    RAISE EXCEPTION 'Payment.property_id (%) must equal listing.property_id (%)', NEW.property_id, l_listing_property_id;
+  END IF;
+
+  RETURN NEW;
+END;
+$function$;
+==================== 11) OPTIONAL DB introspection (runs only if psql works) ====================
+✅ Connected to db: rentease
+
+Tables:
+         table_name         
+----------------------------
+ api_keys
+ audit_logs
+ audit_logs_default
+ contract_parties
+ contract_signatures
+ contractors
+ contracts
+ conversation_participants
+ conversations
+ customer_payment_methods
+ dispute_messages
+ disputes
+ documents
+ email_templates
+ escrow_accounts
+ escrow_transactions
+ escrow_wallet_accounts
+ invoice_payments
+ lead_activities
+ leads
+ maintenance_attachments
+ maintenance_requests
+ maintenance_updates
+ message_attachments
+ messages
+ notifications
+ organizations
+ payment_splits
+ payments
+ payout_accounts
+ payouts
+ platform_settings
+ properties
+ property_listings
+ property_media
+ property_purchase_events
+ property_purchase_payments
+ property_purchases
+ property_sale_details
+ property_sale_disclosures
+ property_viewings
+ purchase_events
+ rent_invoice_payments
+ rent_invoices
+ rent_payments
+ rental_applications
+ saved_listings
+ sms_templates
+ support_tickets
+ tenancies
+ users
+ wallet_accounts
+ wallet_transactions
+(53 rows)
+
+
+payments table:
+                                                                   Table "public.payments"
+         Column          |           Type           | Collation | Nullable |          Default          | Storage  | Compression | Stats target | Description 
+-------------------------+--------------------------+-----------+----------+---------------------------+----------+-------------+--------------+-------------
+ id                      | uuid                     |           | not null | rentease_uuid()           | plain    |             |              | 
+ tenant_id               | uuid                     |           | not null |                           | plain    |             |              | 
+ listing_id              | uuid                     |           | not null |                           | plain    |             |              | 
+ property_id             | uuid                     |           | not null |                           | plain    |             |              | 
+ amount                  | numeric(15,2)            |           | not null |                           | main     |             |              | 
+ currency                | character varying(3)     |           |          |                           | extended |             |              | 
+ status                  | payment_status           |           |          | 'pending'::payment_status | plain    |             |              | 
+ transaction_reference   | character varying(100)   |           | not null |                           | extended |             |              | 
+ payment_method          | payment_method           |           | not null |                           | plain    |             |              | 
+ gateway_transaction_id  | character varying(100)   |           |          |                           | extended |             |              | 
+ gateway_response        | jsonb                    |           |          |                           | extended |             |              | 
+ platform_fee_amount     | numeric(15,2)            |           |          |                           | main     |             |              | 
+ agent_markup_amount     | numeric(15,2)            |           |          |                           | main     |             |              | 
+ agent_commission_amount | numeric(15,2)            |           |          |                           | main     |             |              | 
+ payee_amount            | numeric(15,2)            |           |          |                           | main     |             |              | 
+ initiated_at            | timestamp with time zone |           |          | now()                     | plain    |             |              | 
+ completed_at            | timestamp with time zone |           |          |                           | plain    |             |              | 
+ receipt_number          | bigint                   |           |          |                           | plain    |             |              | 
+ receipt_pdf_url         | text                     |           |          |                           | extended |             |              | 
+ receipt_generated       | boolean                  |           |          | false                     | plain    |             |              | 
+ dispute_reason          | text                     |           |          |                           | extended |             |              | 
+ refunded_amount         | numeric(15,2)            |           |          |                           | main     |             |              | 
+ created_at              | timestamp with time zone |           | not null | now()                     | plain    |             |              | 
+ updated_at              | timestamp with time zone |           | not null | now()                     | plain    |             |              | 
+ deleted_at              | timestamp with time zone |           |          |                           | plain    |             |              | 
+ reference_type          | text                     |           |          |                           | extended |             |              | 
+ reference_id            | uuid                     |           |          |                           | plain    |             |              | 
+Indexes:
+    "payments_pkey" PRIMARY KEY, btree (id)
+    "idx_payments_gateway_response_gin" gin (gateway_response)
+    "idx_payments_listing_status" btree (listing_id, status)
+    "idx_payments_property_id" btree (property_id)
+    "idx_payments_reference" btree (reference_type, reference_id)
+    "idx_payments_status_created_at" btree (status, created_at)
+    "idx_payments_tenant_id" btree (tenant_id)
+    "uniq_transaction_reference" UNIQUE CONSTRAINT, btree (transaction_reference)
+Check constraints:
+    "chk_completed_after_initiated" CHECK (completed_at IS NULL OR completed_at >= initiated_at)
+    "chk_payment_amount_positive" CHECK (amount > 0::numeric)
+    "chk_refunded_amount" CHECK (refunded_amount IS NULL OR refunded_amount >= 0::numeric)
+Foreign-key constraints:
+    "payments_listing_id_fkey" FOREIGN KEY (listing_id) REFERENCES property_listings(id) ON DELETE RESTRICT
+    "payments_property_id_fkey" FOREIGN KEY (property_id) REFERENCES properties(id) ON DELETE RESTRICT
+    "payments_tenant_id_fkey" FOREIGN KEY (tenant_id) REFERENCES users(id)
+Referenced by:
+    TABLE "disputes" CONSTRAINT "disputes_payment_id_fkey" FOREIGN KEY (payment_id) REFERENCES payments(id) ON DELETE CASCADE
+    TABLE "invoice_payments" CONSTRAINT "invoice_payments_payment_id_fkey" FOREIGN KEY (payment_id) REFERENCES payments(id) ON DELETE RESTRICT
+    TABLE "payment_splits" CONSTRAINT "payment_splits_payment_id_fkey" FOREIGN KEY (payment_id) REFERENCES payments(id) ON DELETE CASCADE
+    TABLE "property_purchase_payments" CONSTRAINT "property_purchase_payments_payment_id_fkey" FOREIGN KEY (payment_id) REFERENCES payments(id) ON DELETE RESTRICT
+    TABLE "property_purchases" CONSTRAINT "property_purchases_refund_payment_id_fkey" FOREIGN KEY (refund_payment_id) REFERENCES payments(id) ON DELETE SET NULL
+Policies (forced row security enabled):
+    POLICY "payments_delete_policy" FOR DELETE
+      USING (((deleted_at IS NULL) AND ((tenant_id = current_user_uuid()) OR is_admin())))
+    POLICY "payments_insert_policy" FOR INSERT
+      WITH CHECK (((tenant_id = current_user_uuid()) OR is_admin()))
+    POLICY "payments_select_policy" FOR SELECT
+      USING (((deleted_at IS NULL) AND ((tenant_id = current_user_uuid()) OR is_listing_participant(listing_id) OR is_admin())))
+    POLICY "payments_service_update" FOR UPDATE
+      USING ((is_admin() OR (CURRENT_USER = 'rentease_service'::name)))
+      WITH CHECK ((is_admin() OR (CURRENT_USER = 'rentease_service'::name)))
+    POLICY "payments_update_policy" FOR UPDATE
+      USING (is_admin())
+      WITH CHECK (is_admin())
+Triggers:
+    audit_payments AFTER INSERT OR DELETE OR UPDATE ON payments FOR EACH ROW EXECUTE FUNCTION audit_log_trigger()
+    set_updated_at_payments BEFORE UPDATE ON payments FOR EACH ROW EXECUTE FUNCTION set_updated_at()
+    trg_validate_payment_matches_listing BEFORE INSERT OR UPDATE OF listing_id, property_id, amount, currency ON payments FOR EACH ROW EXECUTE FUNCTION validate_payment_matches_listing()
+    trigger_payments_success AFTER UPDATE OF status ON payments FOR EACH ROW WHEN (new.status = 'successful'::payment_status) EXECUTE FUNCTION payments_success_trigger_fn()
+Access method: heap
+
+
+rent_invoices table:
+                                                                    Table "public.rent_invoices"
+     Column      |           Type           | Collation | Nullable |                  Default                  | Storage  | Compression | Stats target | Description 
+-----------------+--------------------------+-----------+----------+-------------------------------------------+----------+-------------+--------------+-------------
+ id              | uuid                     |           | not null | rentease_uuid()                           | plain    |             |              | 
+ organization_id | uuid                     |           | not null | current_organization_uuid()               | plain    |             |              | 
+ tenancy_id      | uuid                     |           | not null |                                           | plain    |             |              | 
+ tenant_id       | uuid                     |           | not null |                                           | plain    |             |              | 
+ property_id     | uuid                     |           | not null |                                           | plain    |             |              | 
+ invoice_number  | bigint                   |           |          | nextval('rentease_invoice_seq'::regclass) | plain    |             |              | 
+ status          | invoice_status           |           |          | 'issued'::invoice_status                  | plain    |             |              | 
+ period_start    | date                     |           | not null |                                           | plain    |             |              | 
+ period_end      | date                     |           | not null |                                           | plain    |             |              | 
+ due_date        | date                     |           | not null |                                           | plain    |             |              | 
+ subtotal        | numeric(15,2)            |           | not null |                                           | main     |             |              | 
+ late_fee_amount | numeric(15,2)            |           |          | 0                                         | main     |             |              | 
+ total_amount    | numeric(15,2)            |           | not null |                                           | main     |             |              | 
+ currency        | character varying(3)     |           |          | 'USD'::character varying                  | extended |             |              | 
+ paid_amount     | numeric(15,2)            |           |          | 0                                         | main     |             |              | 
+ paid_at         | timestamp with time zone |           |          |                                           | plain    |             |              | 
+ notes           | text                     |           |          |                                           | extended |             |              | 
+ created_at      | timestamp with time zone |           | not null | now()                                     | plain    |             |              | 
+ updated_at      | timestamp with time zone |           | not null | now()                                     | plain    |             |              | 
+ deleted_at      | timestamp with time zone |           |          |                                           | plain    |             |              | 
+Indexes:
+    "rent_invoices_pkey" PRIMARY KEY, btree (id)
+    "idx_rent_invoices_org_due" btree (organization_id, due_date, status)
+    "idx_rent_invoices_property" btree (property_id, due_date)
+    "idx_rent_invoices_tenancy" btree (tenancy_id, due_date)
+    "idx_rent_invoices_tenant_due" btree (tenant_id, due_date, status)
+    "uniq_rent_invoice_org_number" UNIQUE, btree (organization_id, invoice_number) WHERE deleted_at IS NULL
+Check constraints:
+    "chk_invoice_amounts" CHECK (subtotal >= 0::numeric AND late_fee_amount >= 0::numeric AND total_amount >= 0::numeric)
+    "chk_invoice_period" CHECK (period_start <= period_end)
+    "chk_paid_amount" CHECK (paid_amount >= 0::numeric)
+Foreign-key constraints:
+    "rent_invoices_organization_id_fkey" FOREIGN KEY (organization_id) REFERENCES organizations(id)
+    "rent_invoices_property_id_fkey" FOREIGN KEY (property_id) REFERENCES properties(id) ON DELETE RESTRICT
+    "rent_invoices_tenancy_id_fkey" FOREIGN KEY (tenancy_id) REFERENCES tenancies(id) ON DELETE CASCADE
+    "rent_invoices_tenant_id_fkey" FOREIGN KEY (tenant_id) REFERENCES users(id) ON DELETE RESTRICT
+Referenced by:
+    TABLE "invoice_payments" CONSTRAINT "invoice_payments_invoice_id_fkey" FOREIGN KEY (invoice_id) REFERENCES rent_invoices(id) ON DELETE CASCADE
+    TABLE "rent_invoice_payments" CONSTRAINT "rent_invoice_payments_invoice_id_fkey" FOREIGN KEY (invoice_id) REFERENCES rent_invoices(id) ON DELETE CASCADE
+    TABLE "rent_payments" CONSTRAINT "rent_payments_invoice_id_fkey" FOREIGN KEY (invoice_id) REFERENCES rent_invoices(id) ON DELETE CASCADE
+Policies (forced row security enabled):
+    POLICY "rent_invoices_delete" FOR DELETE
+      USING ((is_admin() AND (organization_id = current_organization_uuid())))
+    POLICY "rent_invoices_insert" FOR INSERT
+      WITH CHECK (((organization_id = current_organization_uuid()) AND (is_admin() OR is_property_owner_or_default_agent(property_id))))
+    POLICY "rent_invoices_select" FOR SELECT
+      USING (((deleted_at IS NULL) AND (organization_id = current_organization_uuid()) AND (is_admin() OR (tenant_id = current_user_uuid()) OR is_property_owner_or_default_agent(property_id))))
+    POLICY "rent_invoices_update" FOR UPDATE
+      USING (((organization_id = current_organization_uuid()) AND (is_admin() OR is_property_owner_or_default_agent(property_id))))
+      WITH CHECK (((organization_id = current_organization_uuid()) AND (is_admin() OR is_property_owner_or_default_agent(property_id))))
+Triggers:
+    audit_rent_invoices AFTER INSERT OR DELETE OR UPDATE ON rent_invoices FOR EACH ROW EXECUTE FUNCTION audit_log_trigger()
+    set_updated_at_rent_invoices BEFORE UPDATE ON rent_invoices FOR EACH ROW EXECUTE FUNCTION set_updated_at()
+Access method: heap
+
+
+invoice_payments table:
+                                                           Table "public.invoice_payments"
+     Column      |           Type           | Collation | Nullable |           Default           | Storage | Compression | Stats target | Description 
+-----------------+--------------------------+-----------+----------+-----------------------------+---------+-------------+--------------+-------------
+ id              | uuid                     |           | not null | rentease_uuid()             | plain   |             |              | 
+ invoice_id      | uuid                     |           | not null |                             | plain   |             |              | 
+ payment_id      | uuid                     |           | not null |                             | plain   |             |              | 
+ amount          | numeric(15,2)            |           | not null |                             | main    |             |              | 
+ created_at      | timestamp with time zone |           | not null | now()                       | plain   |             |              | 
+ organization_id | uuid                     |           |          | current_organization_uuid() | plain   |             |              | 
+Indexes:
+    "invoice_payments_pkey" PRIMARY KEY, btree (id)
+    "idx_invoice_payments_invoice" btree (invoice_id)
+    "idx_invoice_payments_org" btree (organization_id)
+    "idx_invoice_payments_payment" btree (payment_id)
+    "uniq_invoice_payment" UNIQUE CONSTRAINT, btree (invoice_id, payment_id)
+Check constraints:
+    "chk_invoice_payment_amount" CHECK (amount > 0::numeric)
+Foreign-key constraints:
+    "invoice_payments_invoice_id_fkey" FOREIGN KEY (invoice_id) REFERENCES rent_invoices(id) ON DELETE CASCADE
+    "invoice_payments_payment_id_fkey" FOREIGN KEY (payment_id) REFERENCES payments(id) ON DELETE RESTRICT
+Policies (forced row security enabled):
+    POLICY "invoice_payments_select" FOR SELECT
+      USING (((organization_id = current_organization_uuid()) AND (EXISTS ( SELECT 1
+   FROM rent_invoices ri
+  WHERE ((ri.id = invoice_payments.invoice_id) AND (ri.deleted_at IS NULL) AND (ri.organization_id = current_organization_uuid()) AND (is_admin() OR (ri.tenant_id = current_user_uuid()) OR is_property_owner_or_default_agent(ri.property_id)))))))
+    POLICY "invoice_payments_write_delete" FOR DELETE
+      USING ((is_admin() OR (CURRENT_USER = 'rentease_service'::name)))
+    POLICY "invoice_payments_write_insert" FOR INSERT
+      WITH CHECK (((organization_id = current_organization_uuid()) AND (is_admin() OR (CURRENT_USER = 'rentease_service'::name) OR (EXISTS ( SELECT 1
+   FROM (rent_invoices ri
+     JOIN payments p ON ((p.id = invoice_payments.payment_id)))
+  WHERE ((ri.id = invoice_payments.invoice_id) AND (ri.deleted_at IS NULL) AND (ri.organization_id = current_organization_uuid()) AND (ri.tenant_id = current_user_uuid()) AND (p.deleted_at IS NULL) AND (p.tenant_id = current_user_uuid())))))))
+    POLICY "invoice_payments_write_update" FOR UPDATE
+      USING ((is_admin() OR (CURRENT_USER = 'rentease_service'::name)))
+      WITH CHECK (((organization_id = current_organization_uuid()) AND (is_admin() OR (CURRENT_USER = 'rentease_service'::name))))
+Triggers:
+    audit_invoice_payments AFTER INSERT OR DELETE OR UPDATE ON invoice_payments FOR EACH ROW EXECUTE FUNCTION audit_log_trigger()
+Access method: heap
+
+
+validate_payment_matches_listing() source:
+        CREATE OR REPLACE FUNCTION public.validate_payment_matches_listing()
+         RETURNS trigger
+         LANGUAGE plpgsql
+1       AS $function$
+2       DECLARE
+3         l_listed_price numeric(15,2);
+4         l_listing_property_id uuid;
+5       
+6         p_agreed_price numeric(15,2);
+7         p_currency varchar(3);
+8         p_property_id uuid;
+9         p_listing_id uuid;
+10        p_buyer_id uuid;
+11      
+12        -- rent invoice vars (NEW)
+13        ri_total numeric(15,2);
+14        ri_paid numeric(15,2);
+15        ri_currency varchar(3);
+16        ri_property_id uuid;
+17        ri_tenant_id uuid;
+18        ri_tenancy_id uuid;
+19        ri_listing_id uuid;
+20      
+21        ri_remaining numeric(15,2);
+22      BEGIN
+23        -- =========================
+24        -- PURCHASE FLOW VALIDATION (existing)
+25        -- =========================
+26        IF NEW.reference_type = 'purchase' AND NEW.reference_id IS NOT NULL THEN
+27          SELECT agreed_price, currency, property_id, listing_id, buyer_id
+28            INTO p_agreed_price, p_currency, p_property_id, p_listing_id, p_buyer_id
+29          FROM public.property_purchases
+30          WHERE id = NEW.reference_id
+31            AND deleted_at IS NULL
+32          LIMIT 1;
+33      
+34          IF p_property_id IS NULL THEN
+35            RAISE EXCEPTION 'Purchase not found for reference_id=%', NEW.reference_id;
+36          END IF;
+37      
+38          IF NEW.amount <> p_agreed_price THEN
+39            RAISE EXCEPTION 'Payment.amount (%) must equal purchase.agreed_price (%)', NEW.amount, p_agreed_price;
+40          END IF;
+41      
+42          IF NEW.property_id <> p_property_id THEN
+43            RAISE EXCEPTION 'Payment.property_id (%) must equal purchase.property_id (%)', NEW.property_id, p_property_id;
+44          END IF;
+45      
+46          IF NEW.tenant_id <> p_buyer_id THEN
+47            RAISE EXCEPTION 'Payment.tenant_id (%) must equal purchase.buyer_id (%)', NEW.tenant_id, p_buyer_id;
+48          END IF;
+49      
+50          IF p_listing_id IS NOT NULL AND NEW.listing_id <> p_listing_id THEN
+51            RAISE EXCEPTION 'Payment.listing_id (%) must equal purchase.listing_id (%)', NEW.listing_id, p_listing_id;
+52          END IF;
+53      
+54          IF NEW.currency IS NULL THEN
+55            NEW.currency := p_currency;
+56          ELSIF NEW.currency <> p_currency THEN
+57            RAISE EXCEPTION 'Payment.currency (%) must equal purchase.currency (%)', NEW.currency, p_currency;
+58          END IF;
+59      
+60          RETURN NEW;
+61        END IF;
+62      
+63        -- =========================
+64        -- RENT INVOICE VALIDATION (NEW)
+65        -- =========================
+66        IF NEW.reference_type = 'rent_invoice' AND NEW.reference_id IS NOT NULL THEN
+67          -- join to tenancies to enforce listing_id (payments.listing_id is NOT NULL)
+68          SELECT
+69            ri.total_amount,
+70            ri.paid_amount,
+71            ri.currency,
+72            ri.property_id,
+73            ri.tenant_id,
+74            ri.tenancy_id,
+75            t.listing_id
+76          INTO
+77            ri_total,
+78            ri_paid,
+79            ri_currency,
+80            ri_property_id,
+81            ri_tenant_id,
+82            ri_tenancy_id,
+83            ri_listing_id
+84          FROM public.rent_invoices ri
+85          JOIN public.tenancies t ON t.id = ri.tenancy_id
+86          WHERE ri.id = NEW.reference_id
+87            AND ri.deleted_at IS NULL
+88          LIMIT 1;
+89      
+90          IF ri_property_id IS NULL THEN
+91            RAISE EXCEPTION 'Rent invoice not found for reference_id=%', NEW.reference_id;
+92          END IF;
+93      
+94          -- remaining balance (allows partial, blocks overpay)
+95          ri_remaining := (ri_total - COALESCE(ri_paid, 0));
+96      
+97          IF NEW.amount > ri_remaining THEN
+98            RAISE EXCEPTION 'Payment.amount (%) exceeds remaining invoice balance (%)', NEW.amount, ri_remaining;
+99          END IF;
+100     
+101         -- property + tenant must match invoice
+102         IF NEW.property_id <> ri_property_id THEN
+103           RAISE EXCEPTION 'Payment.property_id (%) must equal invoice.property_id (%)', NEW.property_id, ri_property_id;
+104         END IF;
+105     
+106         IF NEW.tenant_id <> ri_tenant_id THEN
+107           RAISE EXCEPTION 'Payment.tenant_id (%) must equal invoice.tenant_id (%)', NEW.tenant_id, ri_tenant_id;
+108         END IF;
+109     
+110         -- enforce listing_id from tenancy (best/strict)
+111         IF ri_listing_id IS NULL THEN
+112           RAISE EXCEPTION 'Tenancy (%) has NULL listing_id. Cannot create payments row because payments.listing_id is required.', ri_tenancy_id;
+113         END IF;
+114     
+115         IF NEW.listing_id <> ri_listing_id THEN
+116           RAISE EXCEPTION 'Payment.listing_id (%) must equal tenancy.listing_id (%) for invoice payments', NEW.listing_id, ri_listing_id;
+117         END IF;
+118     
+119         -- currency: default to invoice currency if not provided; otherwise must match
+120         IF NEW.currency IS NULL THEN
+121           NEW.currency := ri_currency;
+122         ELSIF NEW.currency <> ri_currency THEN
+123           RAISE EXCEPTION 'Payment.currency (%) must equal invoice.currency (%)', NEW.currency, ri_currency;
+124         END IF;
+125     
+126         RETURN NEW;
+127       END IF;
+128     
+129       -- =========================
+130       -- DEFAULT LISTING VALIDATION (existing)
+131       -- =========================
+132       SELECT listed_price, property_id
+133         INTO l_listed_price, l_listing_property_id
+134       FROM public.property_listings
+135       WHERE id = NEW.listing_id
+136         AND deleted_at IS NULL
+137       LIMIT 1;
+138     
+139       IF l_listing_property_id IS NULL THEN
+140         RAISE EXCEPTION 'Listing not found for listing_id=%', NEW.listing_id;
+141       END IF;
+142     
+143       IF NEW.amount <> l_listed_price THEN
+144         RAISE EXCEPTION 'Payment.amount (%) must equal listing.listed_price (%)', NEW.amount, l_listed_price;
+145       END IF;
+146     
+147       IF NEW.property_id <> l_listing_property_id THEN
+148         RAISE EXCEPTION 'Payment.property_id (%) must equal listing.property_id (%)', NEW.property_id, l_listing_property_id;
+149       END IF;
+150     
+151       RETURN NEW;
+152     END;
+153     $function$
+
+payments_success_trigger_fn() source:
+        CREATE OR REPLACE FUNCTION public.payments_success_trigger_fn()
+         RETURNS trigger
+         LANGUAGE plpgsql
+1       AS $function$
+2       BEGIN
+3         IF NEW.status = 'successful' AND OLD.status IS DISTINCT FROM NEW.status THEN
+4           PERFORM wallet_credit_from_splits(NEW.id);
+5         END IF;
+6         RETURN NEW;
+7       END;
+8       $function$
+
+==================== DONE ====================

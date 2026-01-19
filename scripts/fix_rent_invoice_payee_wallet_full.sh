@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+TS="$(date +%Y%m%d_%H%M%S)"
+mkdir -p scripts/.bak
+
+SVC="src/services/rent_invoices.service.ts"
+WALLET_UTIL="src/utils/wallets.ts"
+
+backup() {
+  local f="$1"
+  if [ -f "$f" ]; then
+    cp -v "$f" "scripts/.bak/$(basename "$f").bak.$TS" >/dev/null
+    echo "✅ backup -> scripts/.bak/$(basename "$f").bak.$TS"
+  fi
+}
+
+backup "$SVC"
+backup "$WALLET_UTIL"
+
+# 1) Ensure wallets util exists (and is correct)
+mkdir -p "$(dirname "$WALLET_UTIL")"
+cat > "$WALLET_UTIL" <<'TS'
+import type { PoolClient } from "pg";
+
+export async function ensureWalletAccount(
+  client: PoolClient,
+  args: {
+    organizationId: string;
+    userId: string | null;
+    currency: string;
+    isPlatformWallet: boolean;
+  }
+): Promise<string> {
+  const { rows: found } = await client.query<{ id: string }>(
+    `
+    SELECT id
+    FROM public.wallet_accounts
+    WHERE organization_id = $1::uuid
+      AND user_id IS NOT DISTINCT FROM $2::uuid
+      AND currency = $3::text
+      AND is_platform_wallet = $4::boolean
+    ORDER BY created_at ASC
+    LIMIT 1;
+    `,
+    [args.organizationId, args.userId, args.currency, args.isPlatformWallet]
+  );
+
+  if (found[0]?.id) return found[0].id;
+
+  const { rows: created } = await client.query<{ id: string }>(
+    `
+    INSERT INTO public.wallet_accounts (
+      organization_id,
+      user_id,
+      currency,
+      is_platform_wallet
+    )
+    VALUES ($1::uuid, $2::uuid, $3::text, $4::boolean)
+    ON CONFLICT (organization_id, user_id, currency, is_platform_wallet)
+    DO UPDATE SET organization_id = EXCLUDED.organization_id
+    RETURNING id;
+    `,
+    [args.organizationId, args.userId, args.currency, args.isPlatformWallet]
+  );
+
+  if (!created[0]?.id) throw new Error("ensureWalletAccount: failed to create wallet_account");
+  return created[0].id;
+}
+TS
+echo "✅ wrote: $WALLET_UTIL"
+
+# 2) Rewrite rent_invoices.service.ts cleanly with fixed pay logic
+mkdir -p "$(dirname "$SVC")"
+cat > "$SVC" <<'TS'
+import type { PoolClient } from "pg";
+import type { InvoiceStatus } from "../schemas/rent_invoices.schema.js";
+import { ensureWalletAccount } from "../utils/wallets.js";
+import {
+  findRentInvoiceByTenancyPeriod,
+  insertRentInvoice,
+  listRentInvoices,
+} from "../repos/rent_invoices.repo.js";
+
+type TenancyMini = {
+  id: string;
+  tenant_id: string;
+  property_id: string;
+  rent_amount: string;
+};
+
+type RentInvoiceRow = {
+  id: string;
+  organization_id: string;
+  tenancy_id: string;
+  tenant_id: string;
+  property_id: string;
+  invoice_number: string | number | null;
+  status: InvoiceStatus;
+  period_start: string;
+  period_end: string;
+  due_date: string;
+  subtotal: string;
+  late_fee_amount: string | null;
+  total_amount: string;
+  currency: string | null;
+  paid_amount: string | null;
+  paid_at: string | null;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+};
+
+const RENT_INVOICE_SELECT = `
+  id,
+  organization_id,
+  tenancy_id,
+  tenant_id,
+  property_id,
+  invoice_number,
+  status,
+  period_start::text AS period_start,
+  period_end::text AS period_end,
+  due_date::text AS due_date,
+  subtotal::text AS subtotal,
+  late_fee_amount::text AS late_fee_amount,
+  total_amount::text AS total_amount,
+  currency,
+  paid_amount::text AS paid_amount,
+  paid_at::text AS paid_at,
+  notes,
+  created_at::text AS created_at,
+  updated_at::text AS updated_at,
+  deleted_at::text AS deleted_at
+`;
+
+/**
+ * PAYEE RESOLUTION
+ * Assumes: rent_invoices.tenancy_id -> tenancies.id AND tenancies.landlord_id exists.
+ * If your schema differs, edit this query.
+ */
+async function resolveRentInvoicePayeeUserId(
+  client: PoolClient,
+  invoiceId: string,
+  organizationId: string
+): Promise<string> {
+  const r = await client.query<{ payee_user_id: string }>(
+    `
+    SELECT t.landlord_id AS payee_user_id
+    FROM public.rent_invoices ri
+    JOIN public.tenancies t ON t.id = ri.tenancy_id
+    WHERE ri.id = $1::uuid
+      AND ri.organization_id = $2::uuid
+      AND ri.deleted_at IS NULL
+    LIMIT 1;
+    `,
+    [invoiceId, organizationId]
+  );
+
+  const payee = r.rows[0]?.payee_user_id;
+  if (!payee) throw new Error("Cannot resolve payee_user_id for invoice " + invoiceId);
+  return payee;
+}
+
+export async function getRentInvoices(
+  client: PoolClient,
+  args: {
+    limit: number;
+    offset: number;
+    tenancyId?: string;
+    tenantId?: string;
+    propertyId?: string;
+    status?: InvoiceStatus;
+  }
+) {
+  return listRentInvoices(client, {
+    limit: args.limit,
+    offset: args.offset,
+    tenancy_id: args.tenancyId,
+    tenant_id: args.tenantId,
+    property_id: args.propertyId,
+    status: args.status,
+  });
+}
+
+export async function generateRentInvoiceForTenancy(
+  client: PoolClient,
+  args: {
+    organizationId: string;
+    tenancyId: string;
+    periodStart: string;
+    periodEnd: string;
+    dueDate: string;
+
+    subtotal?: number;
+    lateFeeAmount?: number | null;
+    currency?: string | null;
+    status?: InvoiceStatus | null;
+    notes?: string | null;
+  }
+): Promise<{ row: any; reused: boolean }> {
+  const existing = await findRentInvoiceByTenancyPeriod(client, {
+    tenancy_id: args.tenancyId,
+    period_start: args.periodStart,
+    period_end: args.periodEnd,
+    due_date: args.dueDate,
+  });
+  if (existing) return { row: existing, reused: true };
+
+  const { rows } = await client.query<TenancyMini>(
+    `
+    SELECT
+      id,
+      tenant_id,
+      property_id,
+      rent_amount::text AS rent_amount
+    FROM public.tenancies
+    WHERE id = $1::uuid
+      AND deleted_at IS NULL
+    LIMIT 1;
+    `,
+    [args.tenancyId]
+  );
+
+  const tenancy = rows[0];
+  if (!tenancy) {
+    const e: any = new Error("Tenancy not found");
+    e.code = "TENANCY_NOT_FOUND";
+    throw e;
+  }
+
+  const subtotal = typeof args.subtotal === "number" ? args.subtotal : Number(tenancy.rent_amount);
+  const lateFee = args.lateFeeAmount == null ? 0 : Number(args.lateFeeAmount);
+  const total = subtotal + lateFee;
+
+  const currency = (args.currency ?? "USD") || "USD";
+  const status: InvoiceStatus = (args.status ?? "issued") || "issued";
+
+  const row = await insertRentInvoice(client, {
+    organization_id: args.organizationId,
+    tenancy_id: args.tenancyId,
+    tenant_id: tenancy.tenant_id,
+    property_id: tenancy.property_id,
+    period_start: args.periodStart,
+    period_end: args.periodEnd,
+    due_date: args.dueDate,
+    subtotal,
+    late_fee_amount: lateFee,
+    total_amount: total,
+    currency,
+    status,
+    notes: args.notes ?? null,
+  });
+
+  return { row, reused: false };
+}
+
+/**
+ * PAY
+ * - Idempotent: if invoice already paid => return alreadyPaid=true, no duplicate rows
+ * - Creates:
+ *    public.rent_payments
+ *    public.rent_invoice_payments
+ *    public.wallet_transactions (reference_type='rent_invoice', txn_type='credit_payee')
+ * - Credits PAYEE wallet (not platform wallet)
+ * - Then marks invoice paid.
+ */
+export async function payRentInvoice(
+  client: PoolClient,
+  args: {
+    invoiceId: string;
+    paymentMethod: string;
+    amount?: number | null;
+  }
+): Promise<{ row: RentInvoiceRow; alreadyPaid: boolean }> {
+  // 1) Load invoice
+  const invRes = await client.query<RentInvoiceRow>(
+    `
+    SELECT ${RENT_INVOICE_SELECT}
+    FROM public.rent_invoices
+    WHERE id = $1::uuid
+      AND deleted_at IS NULL
+    LIMIT 1;
+    `,
+    [args.invoiceId]
+  );
+
+  const invoice = invRes.rows[0];
+  if (!invoice) {
+    const e: any = new Error("Invoice not found");
+    e.code = "INVOICE_NOT_FOUND";
+    throw e;
+  }
+
+  // Idempotent short-circuit
+  if (invoice.status === "paid") {
+    return { row: invoice, alreadyPaid: true };
+  }
+
+  const total = Number(invoice.total_amount);
+  const amount = typeof args.amount === "number" ? args.amount : total;
+
+  if (Number(amount) !== Number(total)) {
+    const e: any = new Error(
+      `Payment.amount (${amount}) must equal invoice.total_amount (${invoice.total_amount})`
+    );
+    e.code = "AMOUNT_MISMATCH";
+    throw e;
+  }
+
+  const currency = (invoice.currency ?? "USD") || "USD";
+  const method = args.paymentMethod || "card";
+
+  // 2) Create rent_payments
+  const rpRes = await client.query<{ id: string }>(
+    `
+    INSERT INTO public.rent_payments (
+      organization_id,
+      tenancy_id,
+      invoice_id,
+      tenant_id,
+      property_id,
+      amount,
+      currency,
+      payment_method
+    )
+    VALUES (
+      $1::uuid,
+      $2::uuid,
+      $3::uuid,
+      $4::uuid,
+      $5::uuid,
+      $6::numeric,
+      $7::text,
+      $8::text
+    )
+    RETURNING id;
+    `,
+    [
+      invoice.organization_id,
+      invoice.tenancy_id,
+      invoice.id,
+      invoice.tenant_id,
+      invoice.property_id,
+      amount,
+      currency,
+      method,
+    ]
+  );
+
+  const rentPaymentId = rpRes.rows[0]?.id;
+  if (!rentPaymentId) {
+    const e: any = new Error("Failed to create rent_payment");
+    e.code = "RENT_PAYMENT_CREATE_FAILED";
+    throw e;
+  }
+
+  // 3) Link rent_invoice_payments (idempotent)
+  await client.query(
+    `
+    INSERT INTO public.rent_invoice_payments (
+      organization_id,
+      invoice_id,
+      rent_payment_id,
+      amount
+    )
+    VALUES ($1::uuid, $2::uuid, $3::uuid, $4::numeric)
+    ON CONFLICT DO NOTHING;
+    `,
+    [invoice.organization_id, invoice.id, rentPaymentId, amount]
+  );
+
+  // 4) Credit PAYEE wallet (not platform wallet)
+  const payeeUserId = await resolveRentInvoicePayeeUserId(
+    client,
+    invoice.id,
+    invoice.organization_id
+  );
+
+  const payeeWalletId = await ensureWalletAccount(client, {
+    organizationId: invoice.organization_id,
+    userId: payeeUserId,
+    currency,
+    isPlatformWallet: false,
+  });
+
+  await client.query(
+    `
+    INSERT INTO public.wallet_transactions (
+      organization_id,
+      wallet_account_id,
+      txn_type,
+      reference_type,
+      reference_id,
+      amount,
+      currency,
+      note
+    )
+    VALUES (
+      $1::uuid,
+      $2::uuid,
+      'credit_payee'::wallet_transaction_type,
+      'rent_invoice',
+      $3::uuid,
+      $4::numeric,
+      $5::text,
+      $6::text
+    )
+    ON CONFLICT DO NOTHING;
+    `,
+    [
+      invoice.organization_id,
+      payeeWalletId,
+      invoice.id,
+      amount,
+      currency,
+      `Rent payment for invoice ${invoice.invoice_number ?? invoice.id}`,
+    ]
+  );
+
+  // 5) Mark invoice paid
+  const updRes = await client.query<RentInvoiceRow>(
+    `
+    UPDATE public.rent_invoices
+    SET
+      status = 'paid'::invoice_status,
+      paid_amount = $2::numeric,
+      paid_at = NOW()
+    WHERE id = $1::uuid
+      AND deleted_at IS NULL
+    RETURNING ${RENT_INVOICE_SELECT};
+    `,
+    [invoice.id, amount]
+  );
+
+  return { row: updRes.rows[0]!, alreadyPaid: false };
+}
+TS
+
+echo "✅ wrote: $SVC"
+echo ""
+echo "== DONE =="
+echo "➡️ Restart server: npm run dev"
+echo ""
+echo "➡️ Test (after restart):"
+echo "   export INVOICE_ID=\"<invoice_uuid>\""
+echo "   curl -sS -X POST \"\$API/v1/rent-invoices/\$INVOICE_ID/pay\" \\"
+echo "     -H \"content-type: application/json\" \\"
+echo "     -H \"authorization: Bearer \$TOKEN\" \\"
+echo "     -H \"x-organization-id: \$ORG_ID\" \\"
+echo "     -d '{\"paymentMethod\":\"card\"}' | jq"
+echo ""
+echo "➡️ Verify wallet tx is on a NON-platform wallet:"
+echo "   PAGER=cat psql -d \"\$DB_NAME\" -c \""
+echo "   select wt.reference_type, wt.reference_id, wt.txn_type, wt.amount,"
+echo "          wa.user_id, wa.is_platform_wallet, wt.created_at"
+echo "   from public.wallet_transactions wt"
+echo "   join public.wallet_accounts wa on wa.id = wt.wallet_account_id"
+echo "   where wt.reference_type='rent_invoice'"
+echo "   order by wt.created_at desc"
+echo "   limit 5;\""

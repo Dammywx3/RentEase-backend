@@ -1,0 +1,184 @@
+import type { PoolClient } from "pg";
+import type { InvoiceStatus } from "../schemas/rent_invoices.schema.js";
+
+export type RentInvoiceRow = {
+  id: string;
+  organization_id: string;
+  tenancy_id: string;
+  tenant_id: string;
+  property_id: string;
+  invoice_number: string | number | null;
+  status: InvoiceStatus;
+  period_start: string;
+  period_end: string;
+  due_date: string;
+  subtotal: string;
+  late_fee_amount: string | null;
+  total_amount: string;
+  currency: string | null;
+  paid_amount: string | null;
+  paid_at: string | null;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+};
+
+export const RENT_INVOICE_SELECT = `
+  id,
+  organization_id,
+  tenancy_id,
+  tenant_id,
+  property_id,
+  invoice_number,
+  status,
+  period_start::text AS period_start,
+  period_end::text AS period_end,
+  due_date::text AS due_date,
+  subtotal::text AS subtotal,
+  late_fee_amount::text AS late_fee_amount,
+  total_amount::text AS total_amount,
+  currency,
+  paid_amount::text AS paid_amount,
+  paid_at::text AS paid_at,
+  notes,
+  created_at::text AS created_at,
+  updated_at::text AS updated_at,
+  deleted_at::text AS deleted_at
+`;
+
+export async function listRentInvoices(
+  client: PoolClient,
+  args: {
+    limit: number;
+    offset: number;
+    tenancy_id?: string;
+    tenant_id?: string;
+    property_id?: string;
+    status?: InvoiceStatus;
+  }
+): Promise<RentInvoiceRow[]> {
+  const where: string[] = [
+    "deleted_at IS NULL",
+    "organization_id = current_organization_uuid()",
+  ];
+  const vals: any[] = [];
+  let i = 1;
+
+  if (args.tenancy_id) { where.push(`tenancy_id = $${i++}::uuid`); vals.push(args.tenancy_id); }
+  if (args.tenant_id) { where.push(`tenant_id = $${i++}::uuid`); vals.push(args.tenant_id); }
+  if (args.property_id) { where.push(`property_id = $${i++}::uuid`); vals.push(args.property_id); }
+  if (args.status) { where.push(`status = $${i++}::invoice_status`); vals.push(args.status); }
+
+  vals.push(args.limit);  const limitPos = i++;
+  vals.push(args.offset); const offsetPos = i++;
+
+  const q = `
+    SELECT ${RENT_INVOICE_SELECT}
+    FROM public.rent_invoices
+    WHERE ${where.join(" AND ")}
+    ORDER BY created_at DESC
+    LIMIT $${limitPos}::int
+    OFFSET $${offsetPos}::int;
+  `;
+
+  const res = await client.query<RentInvoiceRow>(q, vals);
+  return res.rows;
+}
+
+export async function findRentInvoiceByTenancyPeriod(
+  client: PoolClient,
+  args: {
+    tenancy_id: string;
+    period_start: string;
+    period_end: string;
+    due_date: string;
+  }
+): Promise<RentInvoiceRow | null> {
+  const res = await client.query<RentInvoiceRow>(
+    `
+    SELECT ${RENT_INVOICE_SELECT}
+    FROM public.rent_invoices
+    WHERE deleted_at IS NULL
+      AND organization_id = current_organization_uuid()
+      AND tenancy_id = $1::uuid
+      AND period_start = $2::date
+      AND period_end = $3::date
+      AND due_date = $4::date
+    LIMIT 1;
+    `,
+    [args.tenancy_id, args.period_start, args.period_end, args.due_date]
+  );
+  return res.rows[0] ?? null;
+}
+
+export async function insertRentInvoice(
+  client: PoolClient,
+  args: {
+    tenancy_id: string;
+    tenant_id: string;
+    property_id: string;
+    period_start: string;
+    period_end: string;
+    due_date: string;
+    subtotal: number;
+    late_fee_amount: number;
+    total_amount: number;
+    currency: string;
+    status: InvoiceStatus;
+    notes: string | null;
+  }
+): Promise<RentInvoiceRow> {
+  // IMPORTANT:
+  // We do NOT pass organization_id here.
+  // DB default current_organization_uuid() fills it (and RLS validates it).
+  const res = await client.query<RentInvoiceRow>(
+    `
+    INSERT INTO public.rent_invoices (
+      tenancy_id,
+      tenant_id,
+      property_id,
+      period_start,
+      period_end,
+      due_date,
+      subtotal,
+      late_fee_amount,
+      total_amount,
+      currency,
+      status,
+      notes
+    )
+    VALUES (
+      $1::uuid,
+      $2::uuid,
+      $3::uuid,
+      $4::date,
+      $5::date,
+      $6::date,
+      $7::numeric,
+      $8::numeric,
+      $9::numeric,
+      $10::varchar,
+      $11::invoice_status,
+      $12::text
+    )
+    RETURNING ${RENT_INVOICE_SELECT};
+    `,
+    [
+      args.tenancy_id,
+      args.tenant_id,
+      args.property_id,
+      args.period_start,
+      args.period_end,
+      args.due_date,
+      args.subtotal,
+      args.late_fee_amount,
+      args.total_amount,
+      args.currency,
+      args.status,
+      args.notes,
+    ]
+  );
+
+  return res.rows[0]!;
+}

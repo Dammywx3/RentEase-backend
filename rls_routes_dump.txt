@@ -1,0 +1,154 @@
+============================================================
+RentEase: Dump routes that use RLS context (imports + ctx lines)
+PWD: /Users/mac/Downloads/RentEase--Backend
+============================================================
+
+Found 12 route files touching tx/RLS:
+ - src/routes/listings.ts
+ - src/routes/purchase_escrow.ts
+ - src/routes/me.ts
+ - src/routes/purchase_close.ts
+ - src/routes/payments.ts
+ - src/routes/organizations.ts
+ - src/routes/applications.ts
+ - src/routes/viewings.ts
+ - src/routes/webhooks.ts
+ - src/routes/rent_invoices.ts
+ - src/routes/tenancies.ts
+ - src/routes/purchases.routes.ts
+
+============================================================
+FILE: src/routes/listings.ts
+------------------------------------------------------------
+[Imports: withRlsTransaction / setPgContext / app.pg.connect]
+
+[CTX extraction lines: req.user / req.orgId / x-organization-id / headers]
+
+[Transaction usage: withRlsTransaction / BEGIN / COMMIT / ROLLBACK]
+
+[Route handlers: app.get/app.post/app.patch/app.put]
+
+============================================================
+FILE: src/routes/purchase_escrow.ts
+------------------------------------------------------------
+[Imports: withRlsTransaction / setPgContext / app.pg.connect]
+
+[CTX extraction lines: req.user / req.orgId / x-organization-id / headers]
+
+[Transaction usage: withRlsTransaction / BEGIN / COMMIT / ROLLBACK]
+
+[Route handlers: app.get/app.post/app.patch/app.put]
+
+============================================================
+FILE: src/routes/me.ts
+------------------------------------------------------------
+[Imports: withRlsTransaction / setPgContext / app.pg.connect]
+
+[CTX extraction lines: req.user / req.orgId / x-organization-id / headers]
+
+[Transaction usage: withRlsTransaction / BEGIN / COMMIT / ROLLBACK]
+
+[Route handlers: app.get/app.post/app.patch/app.put]
+
+============================================================
+FILE: src/routes/purchase_close.ts
+------------------------------------------------------------
+[Imports: withRlsTransaction / setPgContext / app.pg.connect]
+
+[CTX extraction lines: req.user / req.orgId / x-organization-id / headers]
+
+[Transaction usage: withRlsTransaction / BEGIN / COMMIT / ROLLBACK]
+
+[Route handlers: app.get/app.post/app.patch/app.put]
+
+============================================================
+FILE: src/routes/payments.ts
+------------------------------------------------------------
+[Imports: withRlsTransaction / setPgContext / app.pg.connect]
+
+[CTX extraction lines: req.user / req.orgId / x-organization-id / headers]
+
+[Transaction usage: withRlsTransaction / BEGIN / COMMIT / ROLLBACK]
+
+[Route handlers: app.get/app.post/app.patch/app.put]
+
+============================================================
+FILE: src/routes/organizations.ts
+------------------------------------------------------------
+[Imports: withRlsTransaction / setPgContext / app.pg.connect]
+
+[CTX extraction lines: req.user / req.orgId / x-organization-id / headers]
+
+[Transaction usage: withRlsTransaction / BEGIN / COMMIT / ROLLBACK]
+
+[Route handlers: app.get/app.post/app.patch/app.put]
+
+============================================================
+FILE: src/routes/applications.ts
+------------------------------------------------------------
+[Imports: withRlsTransaction / setPgContext / app.pg.connect]
+
+[CTX extraction lines: req.user / req.orgId / x-organization-id / headers]
+
+[Transaction usage: withRlsTransaction / BEGIN / COMMIT / ROLLBACK]
+
+[Route handlers: app.get/app.post/app.patch/app.put]
+
+============================================================
+FILE: src/routes/viewings.ts
+------------------------------------------------------------
+[Imports: withRlsTransaction / setPgContext / app.pg.connect]
+
+[CTX extraction lines: req.user / req.orgId / x-organization-id / headers]
+
+[Transaction usage: withRlsTransaction / BEGIN / COMMIT / ROLLBACK]
+
+[Route handlers: app.get/app.post/app.patch/app.put]
+
+============================================================
+FILE: src/routes/webhooks.ts
+------------------------------------------------------------
+[Imports: withRlsTransaction / setPgContext / app.pg.connect]
+
+[CTX extraction lines: req.user / req.orgId / x-organization-id / headers]
+
+[Transaction usage: withRlsTransaction / BEGIN / COMMIT / ROLLBACK]
+
+[Route handlers: app.get/app.post/app.patch/app.put]
+
+============================================================
+FILE: src/routes/rent_invoices.ts
+------------------------------------------------------------
+[Imports: withRlsTransaction / setPgContext / app.pg.connect]
+
+[CTX extraction lines: req.user / req.orgId / x-organization-id / headers]
+
+[Transaction usage: withRlsTransaction / BEGIN / COMMIT / ROLLBACK]
+
+[Route handlers: app.get/app.post/app.patch/app.put]
+
+============================================================
+FILE: src/routes/tenancies.ts
+------------------------------------------------------------
+[Imports: withRlsTransaction / setPgContext / app.pg.connect]
+
+[CTX extraction lines: req.user / req.orgId / x-organization-id / headers]
+
+[Transaction usage: withRlsTransaction / BEGIN / COMMIT / ROLLBACK]
+
+[Route handlers: app.get/app.post/app.patch/app.put]
+
+============================================================
+FILE: src/routes/purchases.routes.ts
+------------------------------------------------------------
+[Imports: withRlsTransaction / setPgContext / app.pg.connect]
+
+[CTX extraction lines: req.user / req.orgId / x-organization-id / headers]
+
+[Transaction usage: withRlsTransaction / BEGIN / COMMIT / ROLLBACK]
+
+[Route handlers: app.get/app.post/app.patch/app.put]
+
+============================================================
+✅ Saved to: rls_routes_dump.txt
+Now run: cat rls_routes_dump.txt

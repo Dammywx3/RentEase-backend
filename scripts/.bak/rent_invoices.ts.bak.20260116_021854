@@ -1,0 +1,234 @@
+import type { FastifyInstance } from "fastify";
+import type { PoolClient } from "pg";
+import { z } from "zod";
+
+import {
+  generateRentInvoiceForTenancy,
+  getRentInvoices,
+  payRentInvoice,
+} from "../services/rent_invoices.service.js";
+
+import {
+  GenerateRentInvoiceBodySchema,
+  ListRentInvoicesQuerySchema,
+  PayRentInvoiceBodySchema,
+} from "../schemas/rent_invoices.schema.js";
+
+async function ensureAuth(app: FastifyInstance, req: any, reply: any) {
+  try {
+    // Preferred: fastify-jwt adds req.jwtVerify()
+    if (typeof req?.jwtVerify === "function") {
+      await req.jwtVerify();
+      return null;
+    }
+
+    // Fallback: some projects expose app.authenticate(req, reply)
+    if (typeof (app as any).authenticate === "function") {
+      await (app as any).authenticate(req, reply);
+      return null;
+    }
+
+    return reply.code(500).send({
+      ok: false,
+      error: "JWT_NOT_CONFIGURED",
+      message: "jwtVerify/app.authenticate not found. Ensure JWT plugin is registered.",
+    });
+  } catch {
+    return reply.code(401).send({ ok: false, error: "UNAUTHORIZED", message: "Unauthorized" });
+  }
+}
+
+function requireUserId(req: any) {
+  const sub = req?.user?.sub;
+  if (!sub) {
+    const e: any = new Error("Missing authenticated user id (req.user.sub)");
+    e.code = "USER_ID_MISSING";
+    throw e;
+  }
+  return sub as string;
+}
+
+export async function rentInvoicesRoutes(app: FastifyInstance) {
+  // -----------------------------
+  // Generate invoice for a tenancy
+  // -----------------------------
+  app.post("/v1/tenancies/:id/rent-invoices/generate", async (req, reply) => {
+    const authResp = await ensureAuth(app, req, reply);
+    if (authResp) return authResp;
+
+    try {
+      requireUserId(req);
+
+      const params = z.object({ id: z.string().uuid() }).parse(req.params);
+      const body = GenerateRentInvoiceBodySchema.parse(req.body);
+
+      const pgAny: any = (app as any).pg;
+      if (!pgAny?.connect) {
+        return reply.code(500).send({
+          ok: false,
+          error: "PG_NOT_CONFIGURED",
+          message: "Fastify pg plugin not found at app.pg",
+        });
+      }
+
+      const client = (await pgAny.connect()) as PoolClient;
+      try {
+        await client.query("BEGIN");
+
+        const res = await generateRentInvoiceForTenancy(client, {
+          tenancyId: params.id,
+          periodStart: body.periodStart,
+          periodEnd: body.periodEnd,
+          dueDate: body.dueDate,
+          subtotal: body.subtotal,
+          lateFeeAmount: body.lateFeeAmount,
+          currency: body.currency,
+          status: body.status,
+          notes: body.notes,
+        });
+
+        await client.query("COMMIT");
+        return reply.send({ ok: true, reused: res.reused, data: res.row });
+      } catch (err: any) {
+        await client.query("ROLLBACK");
+        return reply.code(500).send({
+          ok: false,
+          error: err?.code ?? "INTERNAL_ERROR",
+          message: err?.message ?? String(err),
+        });
+      } finally {
+        client.release();
+      }
+    } catch (err: any) {
+      return reply.code(400).send({
+        ok: false,
+        error: err?.code ?? "BAD_REQUEST",
+        message: err?.message ?? String(err),
+      });
+    }
+  });
+
+  // -----------------------------
+  // List invoices
+  // -----------------------------
+  app.get("/v1/rent-invoices", async (req, reply) => {
+    const authResp = await ensureAuth(app, req, reply);
+    if (authResp) return authResp;
+
+    try {
+      requireUserId(req);
+
+      const q = ListRentInvoicesQuerySchema.parse((req as any).query);
+
+      const pgAny: any = (app as any).pg;
+      if (!pgAny?.connect) {
+        return reply.code(500).send({
+          ok: false,
+          error: "PG_NOT_CONFIGURED",
+          message: "Fastify pg plugin not found at app.pg",
+        });
+      }
+
+      const client = (await pgAny.connect()) as PoolClient;
+      try {
+        const data = await getRentInvoices(client, {
+          limit: q.limit,
+          offset: q.offset,
+          tenancyId: q.tenancyId,
+          tenantId: q.tenantId,
+          propertyId: q.propertyId,
+          status: q.status,
+        });
+
+        return reply.send({ ok: true, data, paging: { limit: q.limit, offset: q.offset } });
+      } catch (err: any) {
+        return reply.code(500).send({
+          ok: false,
+          error: err?.code ?? "INTERNAL_ERROR",
+          message: err?.message ?? String(err),
+        });
+      } finally {
+        client.release();
+      }
+    } catch (err: any) {
+      return reply.code(400).send({
+        ok: false,
+        error: err?.code ?? "BAD_REQUEST",
+        message: err?.message ?? String(err),
+      });
+    }
+  });
+
+  // -----------------------------
+  // Pay invoice (admin-only for now)
+  // -----------------------------
+  app.post("/v1/rent-invoices/:id/pay", async (req, reply) => {
+    const authResp = await ensureAuth(app, req, reply);
+    if (authResp) return authResp;
+
+    const anyReq = req as any;
+    const userId = anyReq?.user?.sub;
+    if (!userId) {
+      return reply.code(401).send({
+        ok: false,
+        error: "USER_ID_MISSING",
+        message: "Missing authenticated user id (req.user.sub)",
+      });
+    }
+
+    const pgAny: any = (app as any).pg;
+    if (!pgAny?.connect) {
+      return reply.code(500).send({
+        ok: false,
+        error: "PG_NOT_CONFIGURED",
+        message: "Fastify pg plugin not found at app.pg",
+      });
+    }
+
+    const client = (await pgAny.connect()) as PoolClient;
+    try {
+      // 🔒 Admin guard (DB truth)
+      const roleRes = await client.query<{ role: string }>(
+        "select role from public.users where id = $1::uuid limit 1;",
+        [userId]
+      );
+      const dbRole = roleRes.rows[0]?.role;
+
+      if (dbRole !== "admin") {
+        return reply.code(403).send({
+          ok: false,
+          error: "FORBIDDEN",
+          message: "Admin only for now (policy requires admin or service role).",
+        });
+      }
+
+      // satisfy any downstream checks that look at req.user.role
+      anyReq.user = anyReq.user ?? {};
+      anyReq.user.role = "admin";
+
+      const params = z.object({ id: z.string().uuid() }).parse(anyReq.params);
+      const body = PayRentInvoiceBodySchema.parse(anyReq.body);
+
+      await client.query("BEGIN");
+      const res = await payRentInvoice(client, {
+        invoiceId: params.id,
+        paymentMethod: body.paymentMethod,
+        amount: body.amount,
+      });
+      await client.query("COMMIT");
+
+      return reply.send({ ok: true, data: res });
+    } catch (err: any) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+      return reply.code(500).send({
+        ok: false,
+        error: err?.code ?? "INTERNAL_ERROR",
+        message: err?.message ?? String(err),
+      });
+    } finally {
+      client.release();
+    }
+  });
+}

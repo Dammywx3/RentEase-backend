@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_URL="${BASE_URL:-http://127.0.0.1:4000}"
+DB="${DB:-rentease}"
+
+EMAIL="${DEV_EMAIL:-${EMAIL:-}}"
+PASSWORD="${DEV_PASS:-${PASSWORD:-}}"
+PURCHASE_ID="${1:-}"
+
+if [ -z "$PURCHASE_ID" ]; then
+  echo "Usage: ./scripts/e2e_close_purchase.sh <PURCHASE_ID>"
+  exit 1
+fi
+if [ -z "${EMAIL:-}" ] || [ -z "${PASSWORD:-}" ]; then
+  echo "Set credentials first:"
+  echo "  export DEV_EMAIL='dev_...@rentease.local'"
+  echo "  export DEV_PASS='Passw0rd!234'"
+  exit 1
+fi
+
+echo "==> Discovering login route from /debug/routes (if available)..."
+ROUTES="$(curl -s "$BASE_URL/debug/routes" 2>/dev/null || true)"
+LOGIN_PATH="/v1/auth/login"
+if echo "$ROUTES" | grep -qE 'auth/.*login \(POST\)'; then
+  # Most common: /v1/auth/login
+  if echo "$ROUTES" | grep -qE '/v1/.*auth/.*login \(POST\)'; then
+    LOGIN_PATH="/v1/auth/login"
+  fi
+fi
+echo "==> Using login endpoint: $LOGIN_PATH"
+
+echo "==> Login..."
+LOGIN_JSON="$(curl -s -X POST "$BASE_URL$LOGIN_PATH" \
+  -H "Content-Type: application/json" \
+  --data-binary "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}")"
+
+echo "$LOGIN_JSON"
+
+# parse token + org
+TMP="/tmp/rentease_close_login_$$.txt"
+printf "%s" "$LOGIN_JSON" | node - <<'NODE' > "$TMP"
+let raw="";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data",(c)=>raw+=c);
+process.stdin.on("end",()=>{
+  try{
+    const j=JSON.parse(raw||"{}");
+    const token=j.token || j.accessToken || j.access_token || (j.data && (j.data.token || j.data.accessToken || j.data.access_token)) || "";
+    const org=(j.user && (j.user.organization_id || j.user.organizationId)) || (j.data && j.data.user && (j.data.user.organization_id || j.data.user.organizationId)) || j.org || "";
+    const uid=(j.user && (j.user.id||j.user.userId)) || (j.data && j.data.user && (j.data.user.id||j.data.user.userId)) || "";
+    if(!token){ console.log(""); console.log(""); console.log(""); process.exit(0); }
+    console.log(token);
+    console.log(org);
+    console.log(uid);
+  }catch(e){
+    console.log(""); console.log(""); console.log("");
+  }
+});
+NODE
+
+TOKEN="$(sed -n '1p' "$TMP" | tr -d '\r')"
+ORG_ID="$(sed -n '2p' "$TMP" | tr -d '\r')"
+USER_ID="$(sed -n '3p' "$TMP" | tr -d '\r')"
+rm -f "$TMP"
+
+if [ -z "${TOKEN:-}" ] || [ -z "${ORG_ID:-}" ]; then
+  echo "❌ Login failed or route missing. Run:"
+  echo "  curl -s $BASE_URL/debug/routes | sed -n '1,200p'"
+  exit 2
+fi
+
+echo "==> Token length: ${#TOKEN}"
+echo "==> Org ID: $ORG_ID"
+[ -n "${USER_ID:-}" ] && echo "==> User ID: $USER_ID"
+
+echo
+echo "==> Close purchase..."
+curl -s -i -X POST "$BASE_URL/v1/purchases/$PURCHASE_ID/close" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "x-organization-id: $ORG_ID" \
+  -H "Content-Type: application/json" \
+  --data-binary '{}' | sed -n '1,220p'
+
+echo
+echo "==> Verify purchase status..."
+psql -X -P pager=off -d "$DB" -c "
+select id::text, status::text, closed_at, updated_at
+from public.property_purchases
+where id::text='${PURCHASE_ID}'
+limit 1;
+" || true
+
+echo
+echo "==> Verify audit log (your schema: table_name/operation/record_id/change_details)..."
+psql -X -P pager=off -d "$DB" -c "
+select
+  table_name,
+  operation::text as operation,
+  record_id::text as record_id,
+  changed_by::text as changed_by,
+  change_details,
+  created_at
+from public.audit_logs
+where record_id::text='${PURCHASE_ID}'
+order by created_at desc
+limit 10;
+" || true
+
+echo
+echo "✅ Done."

@@ -1,0 +1,29 @@
+import type { FastifyInstance } from "fastify";
+import { rentInvoicesRoutes } from "./rent_invoices.js";
+
+import { healthRoutes } from "./health.js";
+import { demoRoutes } from "./demo.js";
+import { meRoutes } from "./me.js";
+import { organizationRoutes } from "./organizations.js";
+import { authRoutes } from "./auth.js";
+import { propertyRoutes } from "./properties.js";
+import { viewingRoutes } from "./viewings.js";
+import { listingRoutes } from "./listings.js";
+import { applicationRoutes } from "./applications.js";
+import { tenancyRoutes } from "./tenancies.js";
+
+export async function registerRoutes(app: FastifyInstance) {
+  await app.register(healthRoutes);
+  await app.register(demoRoutes);
+
+  await app.register(authRoutes);
+  await app.register(meRoutes);
+
+  await app.register(organizationRoutes);
+  await app.register(propertyRoutes);
+  await app.register(tenancyRoutes);
+  await app.register(viewingRoutes);
+  await app.register(listingRoutes);
+  await app.register(applicationRoutes);
+  await app.register(rentInvoicesRoutes);
+}

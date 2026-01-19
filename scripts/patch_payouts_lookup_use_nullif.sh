@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+FILE="src/services/payouts.service.ts"
+
+ts="$(date +%s)"
+cp "$FILE" "${FILE}.bak.${ts}"
+echo "Backup: ${FILE}.bak.${ts}"
+
+# Replace the two empty-string guard comparisons with nullif()-based comparisons
+# Before:
+#   ($1 <> '' and p.gateway_payout_id = $1)
+#   or ($2 <> '' and p.gateway_payout_id = $2)
+# After:
+#   (p.gateway_payout_id = nullif($1,''))
+#   or (p.gateway_payout_id = nullif($2,''))
+perl -0777 -i -pe '
+  s/\(\$1\s*<>\s*\x27\x27\s+and\s+p\.gateway_payout_id\s*=\s*\$1\)/\(p.gateway_payout_id = nullif(\$1,\x27\x27)\)/g;
+  s/\bor\s+\(\$2\s*<>\s*\x27\x27\s+and\s+p\.gateway_payout_id\s*=\s*\$2\)/or \(p.gateway_payout_id = nullif(\$2,\x27\x27)\)/g;
+' "$FILE"
+
+echo "✅ Patched: $FILE"
+echo
+echo "---- verify (show payout lookup where-clause lines) ----"
+rg -n 'gateway_payout_id\s*=\s*nullif|\\$1 <> ''|\\$2 <> ''' "$FILE" || true
+
+echo
+echo "---- typecheck ----"
+npx tsc -p tsconfig.json --noEmit
+echo "✅ tsc OK"

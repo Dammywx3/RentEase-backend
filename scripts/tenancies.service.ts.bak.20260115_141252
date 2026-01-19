@@ -1,0 +1,80 @@
+import type { PoolClient } from "pg";
+import {
+  createTenancyIdempotent,
+  endTenancyById,
+  listTenancies,
+  type TenancyStatus,
+  type TenancyRow,
+} from "../repos/tenancies.repo.js";
+
+export async function createTenancy(
+  client: PoolClient,
+  input: {
+    tenantId: string;
+    propertyId: string;
+    listingId?: string | null;
+
+    rentAmount: number;
+    securityDeposit?: number | null;
+
+    startDate: string;
+    nextDueDate: string;
+
+    paymentCycle?: string | null;
+    status?: TenancyStatus | null;
+
+    terminationReason?: string | null;
+  }
+): Promise<{ row: TenancyRow; reused: boolean; patched: boolean }> {
+  return createTenancyIdempotent(client, {
+    tenant_id: input.tenantId,
+    property_id: input.propertyId,
+    listing_id: input.listingId ?? null,
+    rent_amount: input.rentAmount,
+    security_deposit: input.securityDeposit ?? null,
+    start_date: input.startDate,
+    next_due_date: input.nextDueDate,
+    payment_cycle: input.paymentCycle ?? null,
+    status: input.status ?? null,
+    termination_reason: input.terminationReason ?? null,
+  });
+}
+
+export async function getTenancies(
+  client: PoolClient,
+  args: {
+    limit: number;
+    offset: number;
+    tenantId?: string;
+    propertyId?: string;
+    listingId?: string;
+    status?: TenancyStatus;
+  }
+): Promise<TenancyRow[]> {
+  return listTenancies(client, {
+    limit: args.limit,
+    offset: args.offset,
+    tenant_id: args.tenantId,
+    property_id: args.propertyId,
+    listing_id: args.listingId,
+    status: args.status,
+  });
+}
+
+/** --- END TENANCY --- */
+export async function endTenancy(
+  client: PoolClient,
+  input: {
+    id: string;
+    status: "ended" | "terminated";
+    endDate?: string | null;
+    terminationReason?: string | null;
+  }
+): Promise<{ row: TenancyRow; changed: boolean }> {
+  return endTenancyById(client, {
+    id: input.id,
+    status: input.status,
+    end_date: input.endDate ?? null,
+    termination_reason: input.terminationReason ?? null,
+  });
+}

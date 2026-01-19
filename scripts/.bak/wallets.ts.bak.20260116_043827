@@ -1,0 +1,43 @@
+import type { PoolClient } from "pg";
+
+export async function ensureWalletAccount(
+  client: PoolClient,
+  params: {
+    organizationId: string;
+    userId: string | null;          // null for platform wallet
+    currency: string;
+    isPlatformWallet: boolean;
+  }
+): Promise<string> {
+  const { organizationId, userId, currency, isPlatformWallet } = params;
+
+  // NOTE: unique constraint exists on (organization_id, user_id, currency, is_platform_wallet)
+  const found = await client.query<{ id: string }>(
+    `
+    select id
+    from public.wallet_accounts
+    where organization_id = $1::uuid
+      and currency = $2
+      and is_platform_wallet = $3
+      and (
+        ($4::uuid is null and user_id is null)
+        or user_id = $4::uuid
+      )
+    limit 1;
+    `,
+    [organizationId, currency, isPlatformWallet, userId]
+  );
+
+  if (found.rowCount && found.rows[0]?.id) return found.rows[0].id;
+
+  const ins = await client.query<{ id: string }>(
+    `
+    insert into public.wallet_accounts (organization_id, user_id, currency, is_platform_wallet)
+    values ($1::uuid, $2::uuid, $3, $4)
+    returning id;
+    `,
+    [organizationId, userId, currency, isPlatformWallet]
+  );
+
+  return ins.rows[0].id;
+}

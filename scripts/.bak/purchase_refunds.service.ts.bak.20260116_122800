@@ -1,0 +1,197 @@
+import type { PoolClient } from "pg";
+import { computePlatformFeeSplit } from "../config/fees.config.js";
+import { debitPayee, debitPlatformFee } from "./ledger.service.js";
+
+export type PurchaseRefundMethod = "card" | "bank_transfer" | "wallet";
+
+type PurchaseRow = {
+  id: string;
+  organization_id: string;
+  buyer_id: string;
+  seller_id: string;
+  agreed_price: string;
+  currency: string;
+  payment_status: string;
+  paid_amount: string | null;
+  paid_at: string | null;
+  refunded_at: string | null;
+  refunded_amount: string | null;
+  last_payment_id: string | null;
+};
+
+const PURCHASE_SELECT = `
+  id::text AS id,
+  organization_id::text AS organization_id,
+  buyer_id::text AS buyer_id,
+  seller_id::text AS seller_id,
+  agreed_price::text AS agreed_price,
+  currency,
+  payment_status::text AS payment_status,
+  paid_amount::text AS paid_amount,
+  paid_at::text AS paid_at,
+  refunded_at::text AS refunded_at,
+  refunded_amount::text AS refunded_amount,
+  last_payment_id::text AS last_payment_id
+`;
+
+async function getPurchase(client: PoolClient, args: { organizationId: string; purchaseId: string }): Promise<PurchaseRow> {
+  const { rows } = await client.query<PurchaseRow>(
+    `
+    SELECT ${PURCHASE_SELECT}
+    FROM public.property_purchases
+    WHERE id = $1::uuid
+      AND organization_id = $2::uuid
+      AND deleted_at IS NULL
+    LIMIT 1;
+    `,
+    [args.purchaseId, args.organizationId]
+  );
+
+  const row = rows[0];
+  if (!row) {
+    const e: any = new Error("Purchase not found");
+    e.code = "PURCHASE_NOT_FOUND";
+    throw e;
+  }
+  return row;
+}
+
+export async function refundPropertyPurchase(
+  client: PoolClient,
+  args: {
+    organizationId: string;
+    purchaseId: string;
+    amount?: number | null; // defaults to agreed_price
+    reason?: string | null;
+    refundMethod?: PurchaseRefundMethod; // accepted for API compatibility (optional)
+  }
+): Promise<{
+  purchase: PurchaseRow;
+  alreadyRefunded: boolean;
+  platformFeeReversed: number;
+  sellerNetReversed: number;
+}> {
+  const purchase = await getPurchase(client, {
+    organizationId: args.organizationId,
+    purchaseId: args.purchaseId,
+  });
+
+  // Must be paid before refunding
+  if (purchase.payment_status !== "paid") {
+    const e: any = new Error(`Cannot refund when payment_status=${purchase.payment_status}`);
+    e.code = "NOT_PAID";
+    throw e;
+  }
+
+  // If already refunded at DB-level, treat as idempotent
+  if (purchase.refunded_at || purchase.payment_status === "refunded") {
+    const fresh = await getPurchase(client, { organizationId: args.organizationId, purchaseId: purchase.id });
+    return { purchase: fresh, alreadyRefunded: true, platformFeeReversed: 0, sellerNetReversed: 0 };
+  }
+
+  const agreed = Number(purchase.agreed_price);
+  const amount = typeof args.amount === "number" ? args.amount : agreed;
+
+  if (Number(amount) !== Number(agreed)) {
+    const e: any = new Error(`Refund.amount (${amount}) must equal agreed_price (${purchase.agreed_price}) for full refund`);
+    e.code = "AMOUNT_MISMATCH";
+    throw e;
+  }
+
+  const currency = (purchase.currency ?? "USD") || "USD";
+
+  // Compute the same fee split used for the buy flow
+  const split = computePlatformFeeSplit({
+    paymentKind: "buy",
+    amount,
+    currency,
+  });
+
+  // Idempotency guard based on ledger txns:
+  // If both debit txns exist already for this purchase reference, treat as alreadyRefunded.
+  const chk = await client.query<{ txn_type: string; cnt: string }>(
+    `
+    SELECT wt.txn_type::text AS txn_type, count(*)::text AS cnt
+    FROM public.wallet_transactions wt
+    WHERE wt.organization_id = $1::uuid
+      AND wt.reference_type = 'purchase'
+      AND wt.reference_id = $2::uuid
+      AND wt.txn_type IN ('debit_payee'::wallet_transaction_type, 'debit_platform_fee'::wallet_transaction_type)
+    GROUP BY wt.txn_type
+    `,
+    [args.organizationId, purchase.id]
+  );
+
+  const hasPayeeDebit = chk.rows.some((r) => r.txn_type === "debit_payee" && Number(r.cnt) > 0);
+  const hasFeeDebit = chk.rows.some((r) => r.txn_type === "debit_platform_fee" && Number(r.cnt) > 0);
+
+  if (hasPayeeDebit && hasFeeDebit) {
+    // ensure milestone fields are set too (safe)
+    await client.query(
+      `
+      UPDATE public.property_purchases
+      SET
+        payment_status = 'refunded'::purchase_payment_status,
+        refunded_at = COALESCE(refunded_at, NOW()),
+        refunded_amount = COALESCE(refunded_amount, 0) + $1::numeric,
+        updated_at = NOW()
+      WHERE id = $2::uuid
+        AND organization_id = $3::uuid
+        AND deleted_at IS NULL;
+      `,
+      [amount, purchase.id, args.organizationId]
+    );
+
+    const fresh = await getPurchase(client, { organizationId: args.organizationId, purchaseId: purchase.id });
+    return { purchase: fresh, alreadyRefunded: true, platformFeeReversed: 0, sellerNetReversed: 0 };
+  }
+
+  // 1) reverse platform fee (debit platform wallet)
+  await debitPlatformFee(client, {
+    organizationId: args.organizationId,
+    referenceType: "purchase",
+    referenceId: purchase.id,
+    amount: split.platformFee,
+    currency,
+    note: `Refund reversal: platform fee for purchase ${purchase.id}`,
+  });
+
+  // 2) reverse seller net (debit seller wallet)
+  await debitPayee(client, {
+    organizationId: args.organizationId,
+    payeeUserId: purchase.seller_id,
+    referenceType: "purchase",
+    referenceId: purchase.id,
+    amount: split.payeeNet,
+    currency,
+    note: `Refund reversal: seller net for purchase ${purchase.id}`,
+  });
+
+  // 3) update refund milestone fields
+  await client.query(
+    `
+    UPDATE public.property_purchases
+    SET
+      payment_status = 'refunded'::purchase_payment_status,
+      refunded_at = COALESCE(refunded_at, NOW()),
+      refunded_amount = COALESCE(refunded_amount, 0) + $1::numeric,
+      updated_at = NOW()
+    WHERE id = $2::uuid
+      AND organization_id = $3::uuid
+      AND deleted_at IS NULL;
+    `,
+    [amount, purchase.id, args.organizationId]
+  );
+
+  const updated = await getPurchase(client, {
+    organizationId: args.organizationId,
+    purchaseId: purchase.id,
+  });
+
+  return {
+    purchase: updated,
+    alreadyRefunded: false,
+    platformFeeReversed: split.platformFee,
+    sellerNetReversed: split.payeeNet,
+  };
+}

@@ -1,0 +1,111 @@
+import type { PoolClient } from "pg";
+
+export type ViewingRow = {
+  id: string;
+  listing_id: string;
+  property_id: string;
+  tenant_id: string;
+  scheduled_at: string;
+  view_mode: "in_person" | "virtual" | null;
+  status: "pending" | "confirmed" | "completed" | "cancelled" | null;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export async function insertViewing(
+  client: PoolClient,
+  data: {
+    listing_id: string;
+    property_id: string;
+    tenant_id: string;
+    scheduled_at: string;
+    view_mode?: ViewingRow["view_mode"];
+    status?: ViewingRow["status"];
+    notes?: string | null;
+  }
+): Promise<ViewingRow> {
+  const { rows } = await client.query<ViewingRow>(
+    `
+    INSERT INTO property_viewings (
+      listing_id, property_id, tenant_id,
+      scheduled_at, view_mode, status, notes
+    )
+    VALUES (
+      $1,$2,$3,
+      $4::timestamptz,
+      COALESCE($5, 'in_person'::viewing_mode),
+      COALESCE($6, 'pending'::viewing_status),
+      $7
+    )
+    RETURNING *;
+    `,
+    [
+      data.listing_id,
+      data.property_id,
+      data.tenant_id,
+      data.scheduled_at,
+      data.view_mode ?? null,
+      data.status ?? null,
+      data.notes ?? null,
+    ]
+  );
+  return rows[0]!;
+}
+
+export async function getViewingById(client: PoolClient, id: string): Promise<ViewingRow | null> {
+  const { rows } = await client.query<ViewingRow>(`SELECT * FROM property_viewings WHERE id=$1 LIMIT 1`, [id]);
+  return rows[0] ?? null;
+}
+
+export async function listViewings(
+  client: PoolClient,
+  args: { limit: number; offset: number; listing_id?: string; property_id?: string; tenant_id?: string; status?: ViewingRow["status"]; }
+): Promise<ViewingRow[]> {
+  const where: string[] = ["1=1"];
+  const params: any[] = [];
+  let i = 1;
+
+  if (args.listing_id) { where.push(`listing_id = $${i++}`); params.push(args.listing_id); }
+  if (args.property_id) { where.push(`property_id = $${i++}`); params.push(args.property_id); }
+  if (args.tenant_id) { where.push(`tenant_id = $${i++}`); params.push(args.tenant_id); }
+  if (args.status) { where.push(`status = $${i++}`); params.push(args.status); }
+
+  params.push(args.limit); const limitIdx = i++;
+  params.push(args.offset); const offsetIdx = i++;
+
+  const { rows } = await client.query<ViewingRow>(
+    `
+    SELECT *
+    FROM property_viewings
+    WHERE ${where.join(" AND ")}
+    ORDER BY scheduled_at DESC
+    LIMIT $${limitIdx} OFFSET $${offsetIdx}
+    `,
+    params
+  );
+  return rows;
+}
+
+export async function patchViewing(
+  client: PoolClient,
+  id: string,
+  patch: Partial<{ scheduled_at: string; view_mode: ViewingRow["view_mode"]; status: ViewingRow["status"]; notes: string | null; }>
+): Promise<ViewingRow | null> {
+  const sets: string[] = ["updated_at = now()"];
+  const params: any[] = [];
+  let i = 1;
+
+  for (const [k, v] of Object.entries(patch)) {
+    if (k === "scheduled_at") { sets.push(`${k} = $${i++}::timestamptz`); params.push(v); continue; }
+    sets.push(`${k} = $${i++}`);
+    params.push(v);
+  }
+  params.push(id);
+
+  const { rows } = await client.query<ViewingRow>(
+    `UPDATE property_viewings SET ${sets.join(", ")} WHERE id = $${i} RETURNING *`,
+    params
+  );
+  return rows[0] ?? null;
+}

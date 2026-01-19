@@ -1,0 +1,157 @@
+============================================================
+RLS TODO REPORT (after Fix Pass #1)
+Generated: Sun Jan 18 15:41:52 WAT 2026
+============================================================
+
+A) Files still using app.pg.connect() (manual pool usage):
+------------------------------------------------------------
+src/routes/purchase_close.ts:46:      const client = await app.pg.connect();
+src/routes/tenancies.ts:71:      const client = await app.pg.connect();
+src/routes/tenancies.ts:110:      const client = await app.pg.connect();
+src/routes/tenancies.ts:153:      const client = await app.pg.connect();
+src/routes/tenancies.ts:190:      const client = await app.pg.connect();
+src/routes/purchase_close.ts.bak.1768729811:39:      const client = await app.pg.connect();
+src/routes/purchase_escrow.ts:44:      const client = await app.pg.connect();
+src/routes/purchase_close.ts.bak.1768731027:33:      const client = await app.pg.connect();
+src/routes/purchase_close.ts.bak.1768731106:35:      const client = await app.pg.connect();
+src/routes/purchase_escrow.ts.bak.1768744102:42:      const client = await app.pg.connect();
+src/routes/webhooks.ts:236:      const pg = await app.pg.connect();
+
+B) Files doing manual BEGIN/COMMIT/ROLLBACK:
+------------------------------------------------------------
+src/routes/payments.ts.bak.1768744102:53:        await client.query("BEGIN");
+src/routes/payments.ts.bak.1768744102:69:        await client.query("COMMIT");
+src/routes/payments.ts.bak.1768744102:73:          await client.query("ROLLBACK");
+src/routes/payments.ts.bak.1768744102:122:        await client.query("BEGIN");
+src/routes/payments.ts.bak.1768744102:136:        await client.query("COMMIT");
+src/routes/payments.ts.bak.1768744102:140:          await client.query("ROLLBACK");
+src/routes/payments.ts:55:        await client.query("BEGIN");
+src/routes/payments.ts:72:        await client.query("COMMIT");
+src/routes/payments.ts:76:          await client.query("ROLLBACK");
+src/routes/payments.ts:125:        await client.query("BEGIN");
+src/routes/payments.ts:139:        await client.query("COMMIT");
+src/routes/payments.ts:143:          await client.query("ROLLBACK");
+src/routes/purchase_escrow.ts:46:        await client.query("BEGIN");
+src/routes/purchase_escrow.ts:60:        await client.query("COMMIT");
+src/routes/purchase_escrow.ts:69:          await client.query("ROLLBACK");
+src/routes/purchase_close.ts.bak.1768729811:41:        await client.query("BEGIN");
+src/routes/purchase_close.ts.bak.1768729811:50:          await client.query("ROLLBACK");
+src/routes/purchase_close.ts.bak.1768729811:54:        await client.query("COMMIT");
+src/routes/purchase_close.ts.bak.1768729811:57:        try { await client.query("ROLLBACK"); } catch {}
+src/routes/rent_invoices.ts:123:          await client.query("BEGIN");
+src/routes/rent_invoices.ts:139:          await client.query("COMMIT");
+src/routes/rent_invoices.ts:143:            await client.query("ROLLBACK");
+src/routes/rent_invoices.ts:249:      await client.query("BEGIN");
+src/routes/rent_invoices.ts:257:      await client.query("COMMIT");
+src/routes/rent_invoices.ts:261:        await client.query("ROLLBACK");
+src/routes/tenancies.ts:73:        await client.query("BEGIN");
+src/routes/tenancies.ts:86:        await client.query("COMMIT");
+src/routes/tenancies.ts:89:        try { await client.query("ROLLBACK"); } catch {}
+src/routes/tenancies.ts:112:        await client.query("BEGIN");
+src/routes/tenancies.ts:128:        await client.query("COMMIT");
+src/routes/tenancies.ts:131:        try { await client.query("ROLLBACK"); } catch {}
+src/routes/tenancies.ts:155:        await client.query("BEGIN");
+src/routes/tenancies.ts:165:        await client.query("COMMIT");
+src/routes/tenancies.ts:168:        try { await client.query("ROLLBACK"); } catch {}
+src/routes/tenancies.ts:192:        await client.query("BEGIN");
+src/routes/tenancies.ts:200:        await client.query("COMMIT");
+src/routes/tenancies.ts:203:        try { await client.query("ROLLBACK"); } catch {}
+src/routes/purchases.routes.ts:134:      await client.query("BEGIN");
+src/routes/purchases.routes.ts:191:      await client.query("COMMIT");
+src/routes/purchases.routes.ts:194:      try { await client.query("ROLLBACK"); } catch {}
+src/routes/purchases.routes.ts:220:        await client.query("BEGIN");
+src/routes/purchases.routes.ts:282:          await client.query("ROLLBACK");
+src/routes/purchases.routes.ts:286:        await client.query("COMMIT");
+src/routes/purchases.routes.ts:289:        try { await client.query("ROLLBACK"); } catch {}
+src/routes/purchases.routes.ts:316:        await client.query("BEGIN");
+src/routes/purchases.routes.ts:345:        await client.query("COMMIT");
+src/routes/purchases.routes.ts:348:        try { await client.query("ROLLBACK"); } catch {}
+src/routes/purchases.routes.ts:393:        await client.query("BEGIN");
+src/routes/purchases.routes.ts:408:        await client.query("COMMIT");
+src/routes/purchases.routes.ts:411:        try { await client.query("ROLLBACK"); } catch {}
+src/routes/purchases.routes.ts:460:        await client.query("BEGIN");
+src/routes/purchases.routes.ts:471:          await client.query("ROLLBACK");
+src/routes/purchases.routes.ts:481:        await client.query("COMMIT");
+src/routes/purchases.routes.ts:499:        try { await client.query("ROLLBACK"); } catch {}
+src/routes/purchases.routes.ts:550:        await client.query("BEGIN");
+src/routes/purchases.routes.ts:561:          await client.query("ROLLBACK");
+src/routes/purchases.routes.ts:566:          await client.query("ROLLBACK");
+src/routes/purchases.routes.ts:572:          await client.query("ROLLBACK");
+src/routes/purchases.routes.ts:586:        await client.query("COMMIT");
+src/routes/purchases.routes.ts:604:        try { await client.query("ROLLBACK"); } catch {}
+src/routes/purchases.routes.ts:657:        await client.query("BEGIN");
+src/routes/purchases.routes.ts:680:          await client.query("ROLLBACK");
+src/routes/purchases.routes.ts:689:              await client.query("ROLLBACK");
+src/routes/purchases.routes.ts:712:              await client.query("ROLLBACK");
+src/routes/purchases.routes.ts:722:                await client.query("ROLLBACK");
+src/routes/purchases.routes.ts:738:        await client.query("COMMIT");
+src/routes/purchases.routes.ts:742:        try { await client.query("ROLLBACK"); } catch {}
+src/routes/purchases.routes.ts:800:        await client.query("BEGIN");
+src/routes/purchases.routes.ts:819:        await client.query("COMMIT");
+src/routes/purchases.routes.ts:822:        try { await client.query("ROLLBACK"); } catch {}
+src/routes/purchase_escrow.ts.bak.1768744102:44:        await client.query("BEGIN");
+src/routes/purchase_escrow.ts.bak.1768744102:57:        await client.query("COMMIT");
+src/routes/purchase_escrow.ts.bak.1768744102:66:          await client.query("ROLLBACK");
+src/routes/webhooks.ts:238:        await pg.query("BEGIN");
+src/routes/webhooks.ts:247:          await pg.query("COMMIT");
+src/routes/webhooks.ts:270:        await pg.query("COMMIT");
+src/routes/webhooks.ts:273:          await pg.query("ROLLBACK");
+src/routes/rent_invoices.ts.bak.1768744102:121:          await client.query("BEGIN");
+src/routes/rent_invoices.ts.bak.1768744102:136:          await client.query("COMMIT");
+src/routes/rent_invoices.ts.bak.1768744102:140:            await client.query("ROLLBACK");
+src/routes/rent_invoices.ts.bak.1768744102:246:      await client.query("BEGIN");
+src/routes/rent_invoices.ts.bak.1768744102:254:      await client.query("COMMIT");
+src/routes/rent_invoices.ts.bak.1768744102:258:        await client.query("ROLLBACK");
+
+C) Any direct set_config calls (should ideally be centralized in setPgContext):
+------------------------------------------------------------
+src/db/rls_tx.ts.bak.1768743835:71: * - set_config(..., true) is LOCAL to the transaction → avoids pool leakage.
+src/services/purchase_escrow.service.ts:34:  await client.query("select set_config('app.organization_id', $1, true)", [row.organization_id]);
+src/services/rent_invoice_payments.service.ts:387:    await client.query("select set_config('app.organization_id', $1, true)", [orgId]);
+src/routes/payments.ts.bak.1768744102:56:        await client.query("select set_config('app.organization_id', $1, true)", [organizationId]);
+src/routes/payments.ts.bak.1768744102:57:        await client.query("select set_config('request.header.x_organization_id', $1, true)", [organizationId]);
+src/routes/payments.ts.bak.1768744102:58:        await client.query("select set_config('request.jwt.claim.sub', $1, true)", [userId]);
+src/routes/payments.ts.bak.1768744102:59:        await client.query("select set_config('app.user_id', $1, true)", [userId]);
+src/routes/payments.ts.bak.1768744102:125:        await client.query("select set_config('app.organization_id', $1, true)", [organizationId]);
+src/routes/payments.ts.bak.1768744102:126:        await client.query("select set_config('request.header.x_organization_id', $1, true)", [organizationId]);
+src/routes/payments.ts.bak.1768744102:127:        await client.query("select set_config('request.jwt.claim.sub', $1, true)", [userId]);
+src/routes/payments.ts.bak.1768744102:128:        await client.query("select set_config('app.user_id', $1, true)", [userId]);
+src/routes/payments.ts:59:        await client.query("select set_config('app.organization_id', $1, true)", [organizationId]);
+src/routes/payments.ts:60:        await client.query("select set_config('request.header.x_organization_id', $1, true)", [organizationId]);
+src/routes/payments.ts:61:        await client.query("select set_config('request.jwt.claim.sub', $1, true)", [userId]);
+src/routes/payments.ts:62:        await client.query("select set_config('app.user_id', $1, true)", [userId]);
+src/routes/payments.ts:128:        await client.query("select set_config('app.organization_id', $1, true)", [organizationId]);
+src/routes/payments.ts:129:        await client.query("select set_config('request.header.x_organization_id', $1, true)", [organizationId]);
+src/routes/payments.ts:130:        await client.query("select set_config('request.jwt.claim.sub', $1, true)", [userId]);
+src/routes/payments.ts:131:        await client.query("select set_config('app.user_id', $1, true)", [userId]);
+src/routes/purchase_escrow.ts:50:        await client.query("select set_config('app.organization_id', $1, true)", [organizationId]);
+src/routes/purchase_escrow.ts:51:        await client.query("select set_config('request.header.x_organization_id', $1, true)", [organizationId]);
+src/routes/purchase_escrow.ts:52:        await client.query("select set_config('request.jwt.claim.sub', $1, true)", [userId]);
+src/routes/purchase_escrow.ts:53:        await client.query("select set_config('app.user_id', $1, true)", [userId]);
+src/routes/rent_invoices.ts:80:  await client.query("SELECT set_config('request.header.x_organization_id', $1, true);", [orgId]);
+src/routes/rent_invoices.ts:81:  await client.query("SELECT set_config('app.organization_id', $1, true);", [orgId]);
+src/routes/rent_invoices.ts:83:  await client.query("SELECT set_config('request.jwt.claim.sub', $1, true);", [userId]);
+src/routes/rent_invoices.ts:84:  await client.query("SELECT set_config('app.user_id', $1, true);", [userId]);
+src/routes/rent_invoices.ts:86:  await client.query("SELECT set_config('request.user_role', $1, true);", [role]);
+src/routes/rent_invoices.ts:87:  await client.query("SELECT set_config('app.user_role', $1, true);", [role]);
+src/routes/rent_invoices.ts:88:  await client.query("SELECT set_config('rentease.user_role', $1, true);", [role]);
+src/routes/purchase_escrow.ts.bak.1768744102:47:        await client.query("select set_config('app.organization_id', $1, true)", [organizationId]);
+src/routes/purchase_escrow.ts.bak.1768744102:48:        await client.query("select set_config('request.header.x_organization_id', $1, true)", [organizationId]);
+src/routes/purchase_escrow.ts.bak.1768744102:49:        await client.query("select set_config('request.jwt.claim.sub', $1, true)", [userId]);
+src/routes/purchase_escrow.ts.bak.1768744102:50:        await client.query("select set_config('app.user_id', $1, true)", [userId]);
+src/routes/purchases.routes.ts.bak.1768729053:92:    await client.query("select set_config('app.event_note', $1, true)", [clean]);
+src/routes/purchases.routes.ts.bak.1768729053:94:    await client.query("select set_config('app.event_note', '', true)");
+src/routes/purchases.routes.ts.bak.1768729233:92:    await client.query("select set_config('app.event_note', $1, true)", [clean]);
+src/routes/purchases.routes.ts.bak.1768729233:94:    await client.query("select set_config('app.event_note', '', true)");
+src/routes/rent_invoices.ts.bak.1768744102:78:  await client.query("SELECT set_config('request.header.x_organization_id', $1, true);", [orgId]);
+src/routes/rent_invoices.ts.bak.1768744102:79:  await client.query("SELECT set_config('app.organization_id', $1, true);", [orgId]);
+src/routes/rent_invoices.ts.bak.1768744102:81:  await client.query("SELECT set_config('request.jwt.claim.sub', $1, true);", [userId]);
+src/routes/rent_invoices.ts.bak.1768744102:82:  await client.query("SELECT set_config('app.user_id', $1, true);", [userId]);
+src/routes/rent_invoices.ts.bak.1768744102:84:  await client.query("SELECT set_config('request.user_role', $1, true);", [role]);
+src/routes/rent_invoices.ts.bak.1768744102:85:  await client.query("SELECT set_config('app.user_role', $1, true);", [role]);
+src/routes/rent_invoices.ts.bak.1768744102:86:  await client.query("SELECT set_config('rentease.user_role', $1, true);", [role]);
+src/config/db.ts:33:    await client.query("SELECT set_config('app.current_user', $1, true)", [
+src/config/db.ts:36:    await client.query("SELECT set_config('app.current_organization', $1, true)", [
+src/config/database.ts.bak.1768743835:56:    // ✅ MUST be after BEGIN because set_config(..., true) is LOCAL
+src/config/database.ts:56:    // ✅ MUST be after BEGIN because set_config(..., true) is LOCAL
+

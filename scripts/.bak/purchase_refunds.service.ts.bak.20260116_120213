@@ -1,0 +1,178 @@
+import type { PoolClient } from "pg";
+import { debitPayee, debitPlatformFee } from "./ledger.service.js";
+import { getPropertyPurchase } from "./purchase_payments.service.js";
+
+/**
+ * Purchase Refunds Service
+ *
+ * Strategy:
+ *  - Refund is based on reversing the amounts already credited in wallet_transactions for this purchase:
+ *      credit_platform_fee + credit_payee
+ *  - Writes:
+ *      debit_platform_fee (platform wallet)
+ *      debit_payee        (seller wallet)
+ *  - Sets property_purchases:
+ *      payment_status='refunded', refunded_at, refunded_amount
+ *
+ * Idempotent:
+ *  - If debit txns already exist, we mark milestones if missing and return alreadyRefunded=true.
+ */
+
+export async function refundPropertyPurchase(
+  client: PoolClient,
+  args: {
+    organizationId: string;
+    purchaseId: string;
+    amount?: number | null; // optional: defaults to total credited (fee+payee)
+    reason?: string | null;
+  }
+): Promise<{
+  purchase: any;
+  alreadyRefunded: boolean;
+  refundedAmount: number;
+  platformFeeRefunded: number;
+  sellerRefunded: number;
+}> {
+  const purchase = await getPropertyPurchase(client, {
+    organizationId: args.organizationId,
+    purchaseId: args.purchaseId,
+  });
+
+  // Sum credited amounts from ledger for this purchase
+  const credited = await client.query<{
+    fee: string | null;
+    payee: string | null;
+  }>(
+    `
+    SELECT
+      COALESCE(SUM(CASE WHEN txn_type='credit_platform_fee'::wallet_transaction_type THEN amount ELSE 0 END),0)::text AS fee,
+      COALESCE(SUM(CASE WHEN txn_type='credit_payee'::wallet_transaction_type THEN amount ELSE 0 END),0)::text AS payee
+    FROM public.wallet_transactions
+    WHERE organization_id = $1::uuid
+      AND reference_type = 'purchase'
+      AND reference_id = $2::uuid
+    `,
+    [args.organizationId, purchase.id]
+  );
+
+  const feeCredited = Number(credited.rows[0]?.fee || 0);
+  const payeeCredited = Number(credited.rows[0]?.payee || 0);
+  const totalCredited = feeCredited + payeeCredited;
+
+  if (totalCredited <= 0) {
+    const e: any = new Error("No credited ledger transactions found for this purchase. Cannot refund.");
+    e.code = "NOT_PAID";
+    throw e;
+  }
+
+  // Check if already debited
+  const debitedChk = await client.query<{ txn_type: string; cnt: string }>(
+    `
+    SELECT txn_type::text AS txn_type, count(*)::text AS cnt
+    FROM public.wallet_transactions
+    WHERE organization_id = $1::uuid
+      AND reference_type = 'purchase'
+      AND reference_id = $2::uuid
+      AND txn_type IN ('debit_payee'::wallet_transaction_type, 'debit_platform_fee'::wallet_transaction_type)
+    GROUP BY txn_type
+    `,
+    [args.organizationId, purchase.id]
+  );
+
+  const hasDebitPayee = debitedChk.rows.some((r) => r.txn_type === "debit_payee" && Number(r.cnt) > 0);
+  const hasDebitFee = debitedChk.rows.some((r) => r.txn_type === "debit_platform_fee" && Number(r.cnt) > 0);
+
+  // If already refunded in ledger, just ensure milestones are set and return
+  if (hasDebitPayee && hasDebitFee) {
+    await client.query(
+      `
+      UPDATE public.property_purchases
+      SET
+        payment_status = 'refunded'::purchase_payment_status,
+        refunded_at = COALESCE(refunded_at, NOW()),
+        refunded_amount = COALESCE(refunded_amount, $1::numeric),
+        updated_at = NOW()
+      WHERE id = $2::uuid
+        AND organization_id = $3::uuid
+        AND deleted_at IS NULL;
+      `,
+      [totalCredited, purchase.id, args.organizationId]
+    );
+
+    const updated = await getPropertyPurchase(client, {
+      organizationId: args.organizationId,
+      purchaseId: purchase.id,
+    });
+
+    return {
+      purchase: updated,
+      alreadyRefunded: true,
+      refundedAmount: totalCredited,
+      platformFeeRefunded: 0,
+      sellerRefunded: 0,
+    };
+  }
+
+  const amountRequested =
+    typeof args.amount === "number" && args.amount > 0 ? Number(args.amount) : totalCredited;
+
+  if (amountRequested !== totalCredited) {
+    const e: any = new Error(
+      `Refund.amount (${amountRequested}) must equal total credited (${totalCredited}). (We refund exactly what was credited.)`
+    );
+    e.code = "REFUND_AMOUNT_MISMATCH";
+    throw e;
+  }
+
+  const currency = (purchase.currency ?? "USD") || "USD";
+  const noteBase = args.reason ? ` | reason: ${args.reason}` : "";
+
+  // Reverse platform fee + seller net (exact amounts)
+  await debitPlatformFee(client, {
+    organizationId: args.organizationId,
+    referenceType: "purchase",
+    referenceId: purchase.id,
+    amount: feeCredited,
+    currency,
+    note: `Refund: reverse platform fee for purchase ${purchase.id}${noteBase}`,
+  });
+
+  await debitPayee(client, {
+    organizationId: args.organizationId,
+    payeeUserId: purchase.seller_id,
+    referenceType: "purchase",
+    referenceId: purchase.id,
+    amount: payeeCredited,
+    currency,
+    note: `Refund: reverse seller payout for purchase ${purchase.id}${noteBase}`,
+  });
+
+  // Mark milestones
+  await client.query(
+    `
+    UPDATE public.property_purchases
+    SET
+      payment_status = 'refunded'::purchase_payment_status,
+      refunded_at = NOW(),
+      refunded_amount = $1::numeric,
+      updated_at = NOW()
+    WHERE id = $2::uuid
+      AND organization_id = $3::uuid
+      AND deleted_at IS NULL;
+    `,
+    [totalCredited, purchase.id, args.organizationId]
+  );
+
+  const updated = await getPropertyPurchase(client, {
+    organizationId: args.organizationId,
+    purchaseId: purchase.id,
+  });
+
+  return {
+    purchase: updated,
+    alreadyRefunded: false,
+    refundedAmount: totalCredited,
+    platformFeeRefunded: feeCredited,
+    sellerRefunded: payeeCredited,
+  };
+}

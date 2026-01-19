@@ -1,0 +1,262 @@
+import type { PoolClient } from "pg";
+import type { InvoiceStatus } from "../schemas/rent_invoices.schema.js";
+
+export type RentInvoiceRow = {
+  id: string;
+  organization_id: string;
+  tenancy_id: string;
+  tenant_id: string;
+  property_id: string;
+
+  invoice_number: number | null;
+  status: InvoiceStatus;
+
+  period_start: string;
+  period_end: string;
+  due_date: string;
+
+  subtotal: string;
+  late_fee_amount: string | null;
+  total_amount: string;
+
+  currency: string | null;
+  paid_amount: string | null;
+  paid_at: string | null;
+
+  notes: string | null;
+
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+};
+
+const RENT_INVOICE_SELECT = `
+  id,
+  organization_id,
+  tenancy_id,
+  tenant_id,
+  property_id,
+  invoice_number,
+  status,
+  period_start::text AS period_start,
+  period_end::text AS period_end,
+  due_date::text AS due_date,
+  subtotal::text AS subtotal,
+  late_fee_amount::text AS late_fee_amount,
+  total_amount::text AS total_amount,
+  currency,
+  paid_amount::text AS paid_amount,
+  paid_at::text AS paid_at,
+  notes,
+  created_at::text AS created_at,
+  updated_at::text AS updated_at,
+  deleted_at::text AS deleted_at
+`;
+
+export async function getRentInvoiceById(
+  client: PoolClient,
+  invoiceId: string
+): Promise<RentInvoiceRow | null> {
+  const { rows } = await client.query<RentInvoiceRow>(
+    `
+    SELECT ${RENT_INVOICE_SELECT}
+    FROM public.rent_invoices
+    WHERE id = $1::uuid
+      AND deleted_at IS NULL
+    LIMIT 1;
+    `,
+    [invoiceId]
+  );
+  return rows[0] ?? null;
+}
+
+export async function getRentInvoiceByIdForUpdate(
+  client: PoolClient,
+  invoiceId: string
+): Promise<RentInvoiceRow | null> {
+  const { rows } = await client.query<RentInvoiceRow>(
+    `
+    SELECT ${RENT_INVOICE_SELECT}
+    FROM public.rent_invoices
+    WHERE id = $1::uuid
+      AND deleted_at IS NULL
+    FOR UPDATE;
+    `,
+    [invoiceId]
+  );
+  return rows[0] ?? null;
+}
+
+export async function findRentInvoiceByTenancyPeriod(
+  client: PoolClient,
+  args: {
+    tenancy_id: string;
+    period_start: string;
+    period_end: string;
+    due_date: string;
+  }
+): Promise<RentInvoiceRow | null> {
+  const { rows } = await client.query<RentInvoiceRow>(
+    `
+    SELECT ${RENT_INVOICE_SELECT}
+    FROM public.rent_invoices
+    WHERE deleted_at IS NULL
+      AND tenancy_id = $1
+      AND period_start = $2::date
+      AND period_end = $3::date
+      AND due_date = $4::date
+    ORDER BY created_at DESC
+    LIMIT 1;
+    `,
+    [args.tenancy_id, args.period_start, args.period_end, args.due_date]
+  );
+  return rows[0] ?? null;
+}
+
+export async function insertRentInvoice(
+  client: PoolClient,
+  args: {
+    tenancy_id: string;
+    tenant_id: string;
+    property_id: string;
+
+    period_start: string;
+    period_end: string;
+    due_date: string;
+
+    subtotal: number;
+    late_fee_amount: number;
+    total_amount: number;
+
+    currency: string;
+    status: InvoiceStatus;
+    notes?: string | null;
+  }
+): Promise<RentInvoiceRow> {
+  const { rows } = await client.query<RentInvoiceRow>(
+    `
+    INSERT INTO public.rent_invoices (
+      tenancy_id,
+      tenant_id,
+      property_id,
+      period_start,
+      period_end,
+      due_date,
+      subtotal,
+      late_fee_amount,
+      total_amount,
+      currency,
+      status,
+      notes
+    )
+    VALUES (
+      $1::uuid,
+      $2::uuid,
+      $3::uuid,
+      $4::date,
+      $5::date,
+      $6::date,
+      $7::numeric,
+      $8::numeric,
+      $9::numeric,
+      $10::varchar(3),
+      $11::invoice_status,
+      $12::text
+    )
+    RETURNING ${RENT_INVOICE_SELECT};
+    `,
+    [
+      args.tenancy_id,
+      args.tenant_id,
+      args.property_id,
+      args.period_start,
+      args.period_end,
+      args.due_date,
+      args.subtotal,
+      args.late_fee_amount,
+      args.total_amount,
+      args.currency,
+      args.status,
+      args.notes ?? null,
+    ]
+  );
+
+  return rows[0]!;
+}
+
+export async function listRentInvoices(
+  client: PoolClient,
+  args: {
+    limit: number;
+    offset: number;
+    tenancy_id?: string;
+    tenant_id?: string;
+    property_id?: string;
+    status?: InvoiceStatus;
+  }
+): Promise<RentInvoiceRow[]> {
+  const where: string[] = ["deleted_at IS NULL"];
+  const params: any[] = [];
+  let i = 1;
+
+  if (args.tenancy_id) {
+    where.push(`tenancy_id = $${i++}::uuid`);
+    params.push(args.tenancy_id);
+  }
+  if (args.tenant_id) {
+    where.push(`tenant_id = $${i++}::uuid`);
+    params.push(args.tenant_id);
+  }
+  if (args.property_id) {
+    where.push(`property_id = $${i++}::uuid`);
+    params.push(args.property_id);
+  }
+  if (args.status) {
+    where.push(`status = $${i++}::invoice_status`);
+    params.push(args.status);
+  }
+
+  params.push(args.limit);
+  const limitIdx = i++;
+  params.push(args.offset);
+  const offsetIdx = i++;
+
+  const { rows } = await client.query<RentInvoiceRow>(
+    `
+    SELECT ${RENT_INVOICE_SELECT}
+    FROM public.rent_invoices
+    WHERE ${where.join(" AND ")}
+    ORDER BY created_at DESC
+    LIMIT $${limitIdx} OFFSET $${offsetIdx};
+    `,
+    params
+  );
+
+  return rows;
+}
+
+export async function applyInvoicePayment(
+  client: PoolClient,
+  args: { invoice_id: string; amount: number }
+): Promise<RentInvoiceRow> {
+  const { rows } = await client.query<RentInvoiceRow>(
+    `
+    UPDATE public.rent_invoices ri
+    SET
+      paid_amount = COALESCE(ri.paid_amount, 0) + $2::numeric,
+      paid_at = CASE
+        WHEN (COALESCE(ri.paid_amount, 0) + $2::numeric) >= ri.total_amount THEN NOW()
+        ELSE ri.paid_at
+      END,
+      status = CASE
+        WHEN (COALESCE(ri.paid_amount, 0) + $2::numeric) >= ri.total_amount THEN 'paid'::invoice_status
+        ELSE ri.status
+      END
+    WHERE ri.id = $1::uuid
+      AND ri.deleted_at IS NULL
+    RETURNING ${RENT_INVOICE_SELECT};
+    `,
+    [args.invoice_id, args.amount]
+  );
+  return rows[0]!;
+}

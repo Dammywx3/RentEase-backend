@@ -1,0 +1,62 @@
+import { z } from "zod";
+
+export const InvoiceStatus = z.enum([
+  "draft",
+  "issued",
+  "paid",
+  "overdue",
+  "void",
+  "cancelled",
+]);
+
+export const RentInvoiceRowSchema = z.object({
+  id: z.string().uuid(),
+  organization_id: z.string().uuid(),
+  tenancy_id: z.string().uuid(),
+  tenant_id: z.string().uuid(),
+  property_id: z.string().uuid(),
+
+  invoice_number: z.coerce.number().int().nullable().optional(),
+  status: InvoiceStatus,
+
+  period_start: z.string(), // YYYY-MM-DD
+  period_end: z.string(),   // YYYY-MM-DD
+  due_date: z.string(),     // YYYY-MM-DD
+
+  subtotal: z.string(),
+  late_fee_amount: z.string().nullable().optional(),
+  total_amount: z.string(),
+
+  currency: z.string().length(3).nullable().optional(),
+  paid_amount: z.string().nullable().optional(),
+  paid_at: z.string().nullable().optional(),
+
+  notes: z.string().nullable().optional(),
+
+  created_at: z.string(),
+  updated_at: z.string(),
+  deleted_at: z.string().nullable(),
+});
+
+export const ListRentInvoicesQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(200).default(20),
+  offset: z.coerce.number().int().min(0).default(0),
+
+  tenancyId: z.string().uuid().optional(),
+  tenantId: z.string().uuid().optional(),
+  propertyId: z.string().uuid().optional(),
+
+  status: InvoiceStatus.optional(),
+});
+
+export const GenerateRentInvoiceBodySchema = z.object({
+  periodStart: z.string(), // YYYY-MM-DD
+  periodEnd: z.string(),   // YYYY-MM-DD
+  dueDate: z.string(),     // YYYY-MM-DD
+
+  subtotal: z.number().positive().optional(),
+  lateFeeAmount: z.number().min(0).nullable().optional(),
+  currency: z.string().length(3).nullable().optional(),
+  status: InvoiceStatus.nullable().optional(),
+  notes: z.string().nullable().optional(),
+});

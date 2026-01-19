@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/.patch_backups/$TS"
+mkdir -p "$BACKUP_DIR"
+
+say() { printf "\n\033[1m%s\033[0m\n" "$*"; }
+ok()  { printf "✅ %s\n" "$*"; }
+die() { printf "❌ %s\n" "$*"; exit 1; }
+
+need_file() { [[ -f "$1" ]] || die "Missing file: $1"; }
+backup() {
+  local f="$1"
+  local dest="$BACKUP_DIR/${f//\//__}"
+  cp -a "$f" "$dest"
+  ok "Backup: $f -> $dest"
+}
+
+py_patch_inline() {
+  local file="$1"
+  local marker="$2"
+  shift 2
+  local code="$*"
+
+  backup "$file"
+
+  python3 - "$file" "$marker" <<PY
+import sys, pathlib, re
+path = pathlib.Path(sys.argv[1])
+marker = sys.argv[2]
+src = path.read_text(encoding="utf-8")
+
+if marker not in src:
+    raise SystemExit(f"[ABORT] Marker not found in {path}: {marker}")
+
+orig = src
+
+# ---- PATCH START ----
+${code}
+# ---- PATCH END ----
+
+if src == orig:
+    raise SystemExit(f"[ABORT] No changes applied to {path} (patch did nothing).")
+
+path.write_text(src, encoding="utf-8")
+print(f"[OK] Patched {path}")
+PY
+}
+
+say "Repo: $ROOT"
+say "Backups: $BACKUP_DIR"
+
+# ------------------------------------------------------------
+# 0) Required files
+# ------------------------------------------------------------
+need_file "src/services/paystack_finalize.service.ts"
+need_file "src/routes/payments.ts"
+
+# ------------------------------------------------------------
+# 1) Ensure RLS guard exists (for safety)
+# ------------------------------------------------------------
+say "Ensuring: src/db/rls_guard.ts"
+mkdir -p "src/db"
+if [[ -f "src/db/rls_guard.ts" ]]; then
+  backup "src/db/rls_guard.ts"
+fi
+
+cat > "src/db/rls_guard.ts" <<'EOF'
+// src/db/rls_guard.ts
+import type { PoolClient } from "pg";
+
+/**
+ * Ensures org context exists (RLS/session context).
+ */
+export async function assertRlsContext(client: PoolClient) {
+  const { rows } = await client.query<{ org_id: string | null; user_id: string | null }>(`
+    select
+      public.current_organization_uuid()::text as org_id,
+      public.current_user_uuid()::text as user_id
+  `);
+
+  const orgId = rows?.[0]?.org_id ?? null;
+  const userId = rows?.[0]?.user_id ?? null;
+
+  if (!orgId) {
+    const e: any = new Error("RLS_CONTEXT_MISSING: organization not set (setPgContext not applied)");
+    e.code = "RLS_CONTEXT_MISSING_ORG";
+    throw e;
+  }
+
+  return { orgId, userId };
+}
+
+/**
+ * Enforce org + user for normal authenticated routes.
+ */
+export async function assertRlsContextWithUser(client: PoolClient) {
+  const ctx = await assertRlsContext(client);
+  if (!ctx.userId) {
+    const e: any = new Error("RLS_CONTEXT_MISSING: user not set (setPgContext not applied)");
+    e.code = "RLS_CONTEXT_MISSING_USER";
+    throw e;
+  }
+  return ctx;
+}
+EOF
+ok "Wrote src/db/rls_guard.ts"
+
+# ------------------------------------------------------------
+# 2) Patch payments route userId extraction + add RLS guard
+# ------------------------------------------------------------
+say "Patching: src/routes/payments.ts"
+
+py_patch_inline "src/routes/payments.ts" "setPgContext" '
+# Add import for guard
+if "assertRlsContextWithUser" not in src:
+    src = src.replace(
+        \'import { setPgContext } from "../db/set_pg_context.js";\',
+        \'import { setPgContext } from "../db/set_pg_context.js";\\nimport { assertRlsContextWithUser } from "../db/rls_guard.js";\'
+    )
+
+# Fix userId extraction to prefer req.user.id
+src = re.sub(
+    r"const userId\\s*=\\s*String\\(\\(req as any\\)\\.user\\?\\.userId\\s*\\?\\?\\s*\"\"\\)\\.trim\\(\\);",
+    "const userId = String((req as any).user?.id || (req as any).user?.userId || (req as any).userId || \"\").trim();",
+    src
+)
+
+# After setPgContext in BOTH handlers, assert RLS
+src = re.sub(
+    r"(await setPgContext\\(client,\\s*\\{[\\s\\S]*?\\}\\);)",
+    lambda m: m.group(1) + "\\n        await assertRlsContextWithUser(client);",
+    src
+)
+
+# Ensure timezone set on the second endpoint too (your first already has it)
+if "SET LOCAL TIME ZONE \'UTC\'" not in src:
+    pass
+'
+
+ok "Patched payments.ts"
+
+# ------------------------------------------------------------
+# 3) Patch paystack finalize:
+#    - For purchase: fund escrow (hold) instead of paying seller/platform
+#    - Keep rent_invoice behavior unchanged
+# ------------------------------------------------------------
+say "Patching: src/services/paystack_finalize.service.ts"
+
+py_patch_inline "src/services/paystack_finalize.service.ts" "finalizePaystackChargeSuccess" '
+# Add RLS guard import
+if "assertRlsContext" not in src:
+    src = src.replace(
+        \'import { setPgContext } from "../db/set_pg_context.js";\',
+        \'import { setPgContext } from "../db/set_pg_context.js";\\nimport { assertRlsContext } from "../db/rls_guard.js";\'
+    )
+
+# Insert a helper for purchase escrow funding (idempotent + FOR UPDATE + anti-overfund)
+helper_marker = "function approxEqual"
+if "async function finalizePurchaseEscrowFunding" not in src:
+    src = src.replace(
+        helper_marker,
+        """async function finalizePurchaseEscrowFunding(client: PoolClient, args: {
+  organizationId: string;
+  purchaseId: string;
+  amountMajor: number;
+  currency: string;
+  paymentId: string;
+  note?: string | null;
+}): Promise<{ ok: true } | { ok: false; error: string; message?: string }> {
+  // lock purchase row
+  const { rows } = await client.query<{
+    agreed_price: string;
+    escrow_held_amount: string | null;
+    payment_status: string | null;
+  }>(
+    \`
+    select
+      agreed_price::text as agreed_price,
+      escrow_held_amount::text as escrow_held_amount,
+      payment_status::text as payment_status
+    from public.property_purchases
+    where id = $1::uuid
+      and organization_id = $2::uuid
+      and deleted_at is null
+    limit 1
+    for update;
+    \`,
+    [args.purchaseId, args.organizationId]
+  );
+
+  const p = rows?.[0];
+  if (!p) return { ok: false, error: "PURCHASE_NOT_FOUND" };
+
+  const agreed = Number(p.agreed_price);
+  const curHeld = Number(p.escrow_held_amount ?? "0");
+  const nextHeld = curHeld + Number(args.amountMajor);
+
+  if (!Number.isFinite(agreed) || agreed <= 0) {
+    return { ok: false, error: "INVALID_PURCHASE_PRICE" };
+  }
+  if (!Number.isFinite(nextHeld) || nextHeld <= 0) {
+    return { ok: false, error: "INVALID_ESCROW_AMOUNT" };
+  }
+  if (nextHeld > agreed) {
+    return {
+      ok: false,
+      error: "ESCROW_OVERFUND_BLOCKED",
+      message: \`nextHeld=\${nextHeld} > agreed=\${agreed}\`,
+    };
+  }
+
+  // Fund escrow via DB function (expects NEW TOTAL held)
+  await client.query(
+    \`select public.purchase_escrow_hold($1::uuid, $2::uuid, $3::numeric, $4::text, $5::text);\`,
+    [
+      args.purchaseId,
+      args.organizationId,
+      nextHeld,
+      args.currency,
+      args.note ?? "paystack purchase escrow hold",
+    ]
+  );
+
+  // Update purchase payment milestone fields
+  await client.query(
+    \`
+    update public.property_purchases
+    set
+      paid_at = coalesce(paid_at, now()),
+      paid_amount = least(coalesce(paid_amount, 0) + $1::numeric, agreed_price),
+      payment_status = case
+        when (coalesce(paid_amount, 0) + $1::numeric) >= agreed_price then \'paid\'::purchase_payment_status
+        when (coalesce(paid_amount, 0) + $1::numeric) > 0 then \'partially_paid\'::purchase_payment_status
+        else payment_status
+      end,
+      last_payment_id = coalesce(last_payment_id, $2::uuid),
+      updated_at = now()
+    where id = $3::uuid
+      and organization_id = $4::uuid
+      and deleted_at is null;
+    \`,
+    [args.amountMajor, args.paymentId, args.purchaseId, args.organizationId]
+  );
+
+  return { ok: true };
+}
+
+""" + helper_marker
+    )
+
+# In finalizePaystackChargeSuccess:
+# After ensureOrgContextMatchesPayment, enforce org context exists (webhooks can run without user)
+if "await assertRlsContext(client);" not in src:
+    src = src.replace(
+        "await ensureOrgContextMatchesPayment(client, payment.organization_id);",
+        "await ensureOrgContextMatchesPayment(client, payment.organization_id);\\n\\n  // Ensure org RLS context is set (webhook may have no user)\\n  await assertRlsContext(client);"
+    )
+
+# Now, change purchase flow: if reference_type === purchase, skip payee/splits and fund escrow
+# Find where you start resolving payeeUserId.
+marker = "// 2) Resolve payee depending on reference_type (always org-scoped)"
+if marker in src and "finalizePurchaseEscrowFunding" in src:
+    # Insert a purchase-only branch BEFORE payee resolution
+    inject = """
+  // ------------------------------------------------------------
+  // PURCHASE PAYMENT RULE:
+  // For property purchases, do NOT pay seller/platform on webhook.
+  // Instead: mark payment successful + fund escrow (hold).
+  // Seller is paid only when escrow is released (closing).
+  // Platform fee is taken during escrow release (purchase_escrow_release).
+  // ------------------------------------------------------------
+  if (payment.reference_type === "purchase" && payment.reference_id) {
+    // mark payment successful first (no splits)
+    await client.query(
+      `
+      update public.payments
+      set
+        status = 'successful'::public.payment_status,
+        completed_at = now(),
+        gateway_transaction_id = coalesce(gateway_transaction_id, $2::text),
+        gateway_response = coalesce(gateway_response, $3::jsonb),
+        currency = coalesce(currency, $4::text),
+        updated_at = now()
+      where id = $1::uuid
+        and organization_id = $5::uuid
+        and deleted_at is null;
+      `,
+      [
+        payment.id,
+        String(evt.data?.id ?? ""),
+        JSON.stringify(evt),
+        currency,
+        orgId,
+      ]
+    );
+
+    const resEscrow = await finalizePurchaseEscrowFunding(client, {
+      organizationId: orgId,
+      purchaseId: payment.reference_id,
+      amountMajor,
+      currency,
+      paymentId: payment.id,
+      note: `paystack:charge.success:${reference}`,
+    });
+
+    // If escrow funding failed, return ok:false BUT webhook handler still returns 200 (your webhooks.ts does that)
+    if (!resEscrow.ok) return resEscrow;
+
+    return { ok: true };
+  }
+
+"""
+    src = src.replace(marker, inject + marker)
+
+ok = True
+'
+
+ok "Patched paystack_finalize.service.ts"
+
+say "Done. If this is a git repo, inspect diff:"
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git diff --stat || true
+  say "Run: git diff"
+fi
+
+ok "Patch complete. Backups saved at: $BACKUP_DIR"
