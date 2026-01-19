@@ -53,3 +53,7 @@ audit_*/
 
 # build
 dist/
+
+# scripts scratch
+scripts/_snapshots/
+scripts/.tmp_*
